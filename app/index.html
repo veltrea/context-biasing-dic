@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="/src/styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>biasdiff</title>
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+
+  <body>
+    <main class="app">
+      <header class="topbar">
+        <h1>biasdiff</h1>
+        <div class="topbar-controls">
+          <span class="dict-badge" id="dict-badge">IPADIC</span>
+          <label class="toggle">
+            <input type="checkbox" id="strict-toggle" />
+            <span data-i18n="strict">完全一致</span>
+          </label>
+        </div>
+      </header>
+
+      <section class="io">
+        <div class="field">
+          <label for="reference" data-i18n="referenceLabel">正解文</label>
+          <textarea id="reference" spellcheck="false"></textarea>
+        </div>
+        <div class="field">
+          <label for="hypothesis" data-i18n="hypothesisLabel">認識結果</label>
+          <textarea id="hypothesis" spellcheck="false"></textarea>
+        </div>
+      </section>
+
+      <section class="actions">
+        <button id="diff-btn" class="primary" data-i18n="diff">diff を取る</button>
+        <button id="clear-btn" data-i18n="clear">クリア</button>
+        <span class="summary" id="summary"></span>
+      </section>
+
+      <section class="results">
+        <div class="panel">
+          <h2 data-i18n="lastPairs">今回の置換</h2>
+          <ul id="pairs" class="pairs"></ul>
+        </div>
+        <div class="panel">
+          <div class="panel-head">
+            <h2 data-i18n="dangerWords">危険語</h2>
+            <div class="panel-actions">
+              <button id="export-dict-btn" data-i18n="exportDict">辞書を保存</button>
+              <button id="export-reject-btn" data-i18n="exportReject">除外ログ</button>
+            </div>
+          </div>
+          <ol id="danger" class="danger"></ol>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
