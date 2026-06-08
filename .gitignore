@@ -1,0 +1,14 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# 生成物（辞書・別ログ）。素材であり成果物なのでコミットしない。
+/*.dict
+/*.txt.dict
+/dict.txt
+/reject.txt
+/out/
+
+# OS / editor
+.DS_Store
+*.swp

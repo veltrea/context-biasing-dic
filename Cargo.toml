@@ -1,0 +1,41 @@
+[package]
+name = "biasdiff"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Diff-based collector of homophone confusion words for ASR context-biasing dictionaries"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/veltrea/context-biasing-dic"
+readme = "README.md"
+keywords = ["asr", "context-biasing", "morphological-analysis", "homophone", "diff"]
+categories = ["command-line-utilities", "text-processing"]
+
+[[bin]]
+name = "biasdiff"
+path = "src/main.rs"
+
+[lib]
+name = "biasdiff"
+path = "src/lib.rs"
+
+# 辞書はビルド時に埋め込む。default は軽量な IPADIC。
+# UniDic（読み精度が高い・仕様書推奨だがビルドが重い）は次でオプトイン:
+#   cargo build --release --no-default-features --features unidic
+[features]
+default = ["ipadic"]
+ipadic = ["_lindera", "lindera/embed-ipadic"]
+unidic = ["_lindera", "lindera/embed-unidic"]
+# 内部用: Lindera バックエンドを有効化する集約フラグ。直接指定しない。
+_lindera = ["dep:lindera"]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+similar = "2"
+lindera = { version = "3", optional = true }
+
+[profile.release]
+# 辞書埋め込みでバイナリが大きくなるため、サイズ寄りの最適化にしておく。
+opt-level = 2
+lto = "thin"
+strip = true
