@@ -45,6 +45,48 @@ pub fn extract_replacements(reference: &[Token], hypothesis: &[Token]) -> Vec<Re
     pairs
 }
 
+/// diff の1行。Equal（一致）か Replace（置換）。挿入・削除は採らない。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffRow {
+    /// 一致したトークン列。
+    Equal(Vec<Token>),
+    /// 置換ブロック。
+    Replace(ReplacePair),
+}
+
+/// 表記列で diff を取り、Equal と Replace を順に返す（挿入・削除はスキップ）。
+///
+/// `extract_replacements` が置換だけを返すのに対し、こちらは一致行も含めて
+/// 差分の全体像を返す（GUI で「＝」の一致行も見せるため）。
+pub fn diff_rows(reference: &[Token], hypothesis: &[Token]) -> Vec<DiffRow> {
+    let ref_surfaces: Vec<&str> = reference.iter().map(|t| t.surface.as_str()).collect();
+    let hyp_surfaces: Vec<&str> = hypothesis.iter().map(|t| t.surface.as_str()).collect();
+
+    let ops = capture_diff_slices(Algorithm::Myers, &ref_surfaces, &hyp_surfaces);
+
+    let mut rows = Vec::new();
+    for op in ops {
+        match op {
+            DiffOp::Equal { old_index, len, .. } => {
+                rows.push(DiffRow::Equal(reference[old_index..old_index + len].to_vec()));
+            }
+            DiffOp::Replace {
+                old_index,
+                old_len,
+                new_index,
+                new_len,
+            } => {
+                rows.push(DiffRow::Replace(ReplacePair {
+                    reference: reference[old_index..old_index + old_len].to_vec(),
+                    hypothesis: hypothesis[new_index..new_index + new_len].to_vec(),
+                }));
+            }
+            DiffOp::Insert { .. } | DiffOp::Delete { .. } => {}
+        }
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

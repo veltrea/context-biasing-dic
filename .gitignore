@@ -9,6 +9,12 @@ Cargo.lock.orig
 /reject.txt
 /out/
 
+# デザインモック（Stitch 生成の中間素材）。実装は app/ にあり、project ID から再生成も可能なのでコミットしない。
+/design/
+
+# 監査・判断の手元記録。プライバシー詳細を含むため公開リポジトリには載せない。
+/PRIVACY-AUDIT.md
+
 # OS / editor
 .DS_Store
 *.swp

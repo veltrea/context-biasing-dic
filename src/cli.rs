@@ -48,9 +48,16 @@ enum Command {
         /// 読み不一致ペアの別ログ出力先。
         #[arg(long)]
         reject: Option<PathBuf>,
-        /// 出力に出現回数を付ける（`語\t回数`）。
+        /// 出力形式（txt=語のみ / counts=`語\t回数` / amical-json=Amical 取り込み用 JSON）。
+        /// 既定は txt。`--counts` と併用した場合は `--format` を優先する。
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+        /// 後方互換: `--format counts` と同等（`語\t回数`）。`--format` 明示時はそちらを優先。
         #[arg(long)]
         counts: bool,
+        /// `amical-json` 出力時の分野ラベル（JSON の `field`）。
+        #[arg(long, default_value = "general")]
+        field: String,
     },
     /// 対話ループ：正解文→認識結果を貼り、即時 diff して蓄積する。
     Repl {
@@ -60,6 +67,16 @@ enum Command {
         /// 読み不一致ペアの別ログ保存先。
         #[arg(long)]
         reject: Option<PathBuf>,
+        /// 出力形式（txt=語のみ / counts=`語\t回数` / amical-json=Amical 取り込み用 JSON）。
+        /// 既定は txt。`--counts` と併用した場合は `--format` を優先する。
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+        /// 後方互換: `--format counts` と同等（`語\t回数`）。`--format` 明示時はそちらを優先。
+        #[arg(long)]
+        counts: bool,
+        /// `amical-json` 出力時の分野ラベル（JSON の `field`）。
+        #[arg(long, default_value = "general")]
+        field: String,
     },
 }
 
@@ -96,6 +113,38 @@ impl From<DictArg> for DictKind {
     }
 }
 
+/// 危険語リストの出力形式。clap が variant 名をケバブケースの値に変換する
+/// （Txt→`txt`、Counts→`counts`、AmicalJson→`amical-json`）。
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum OutputFormat {
+    /// 1行1語（語のみ）。そのまま ASR の用語集に投入できる。
+    Txt,
+    /// `語\t回数`。解析・停止条件の見極め用。
+    Counts,
+    /// Amical 取り込み用のバイアシング辞書（メタ付き JSON）。
+    AmicalJson,
+}
+
+/// 危険語リストをどう書き出すかの指定。出力形式 `format` と、その分野ラベル
+/// `field`（`amical-json` のときだけ使う）。関数の引数を増やしすぎないよう束ねる。
+#[derive(Copy, Clone)]
+struct OutputSpec<'a> {
+    format: OutputFormat,
+    field: &'a str,
+}
+
+/// `--format` と後方互換の `--counts` から、実効の出力形式を決める。
+///
+/// `--format` を明示したらそれを優先し、無指定なら `--counts` で counts、
+/// どちらも無ければ txt。
+fn resolve_format(format: Option<OutputFormat>, counts: bool) -> OutputFormat {
+    match format {
+        Some(f) => f,
+        None if counts => OutputFormat::Counts,
+        None => OutputFormat::Txt,
+    }
+}
+
 /// エントリポイント。引数を解釈し、サブコマンドへ振り分ける。
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
@@ -113,18 +162,36 @@ pub fn run() -> Result<()> {
             hypothesis,
             output,
             reject,
+            format,
             counts,
-        } => run_batch(
-            &tokenizer,
-            &opts,
-            &reference,
-            &hypothesis,
-            output.as_deref(),
-            reject.as_deref(),
+            field,
+        } => {
+            let spec = OutputSpec {
+                format: resolve_format(format, counts),
+                field: &field,
+            };
+            run_batch(
+                &tokenizer,
+                &opts,
+                &reference,
+                &hypothesis,
+                output.as_deref(),
+                reject.as_deref(),
+                spec,
+            )
+        }
+        Command::Repl {
+            output,
+            reject,
+            format,
             counts,
-        ),
-        Command::Repl { output, reject } => {
-            run_repl(&tokenizer, &opts, output.as_deref(), reject.as_deref())
+            field,
+        } => {
+            let spec = OutputSpec {
+                format: resolve_format(format, counts),
+                field: &field,
+            };
+            run_repl(&tokenizer, &opts, output.as_deref(), reject.as_deref(), spec)
         }
     }
 }
@@ -137,7 +204,7 @@ fn run_batch(
     hypothesis: &Path,
     output: Option<&Path>,
     reject: Option<&Path>,
-    counts: bool,
+    spec: OutputSpec,
 ) -> Result<()> {
     let ref_text = fs::read_to_string(reference)
         .with_context(|| format!("failed to read {}", reference.display()))?;
@@ -173,7 +240,7 @@ fn run_batch(
         collector.add_all(outs);
     }
 
-    emit_dict(&collector, output, counts)?;
+    emit_dict(&collector, output, spec)?;
 
     if let Some(p) = reject {
         let mut w = BufWriter::new(
@@ -203,30 +270,30 @@ fn run_batch(
 }
 
 /// 危険語リストを output（なければ標準出力）へ書き出す。
-fn emit_dict(collector: &Collector, output: Option<&Path>, counts: bool) -> Result<()> {
+fn emit_dict(collector: &Collector, output: Option<&Path>, spec: OutputSpec) -> Result<()> {
     match output {
         Some(p) => {
             let mut w = BufWriter::new(
                 File::create(p).with_context(|| format!("failed to create {}", p.display()))?,
             );
-            write_body(collector, &mut w, counts)?;
+            write_body(collector, &mut w, spec)?;
             w.flush()?;
         }
         None => {
             let stdout = io::stdout();
             let mut w = stdout.lock();
-            write_body(collector, &mut w, counts)?;
+            write_body(collector, &mut w, spec)?;
             w.flush()?;
         }
     }
     Ok(())
 }
 
-fn write_body(collector: &Collector, w: &mut impl Write, counts: bool) -> io::Result<()> {
-    if counts {
-        collector.write_dict_with_counts(w)
-    } else {
-        collector.write_dict(w)
+fn write_body(collector: &Collector, w: &mut impl Write, spec: OutputSpec) -> io::Result<()> {
+    match spec.format {
+        OutputFormat::Txt => collector.write_dict(w),
+        OutputFormat::Counts => collector.write_dict_with_counts(w),
+        OutputFormat::AmicalJson => collector.write_amical_json(w, spec.field),
     }
 }
 
@@ -236,6 +303,7 @@ fn run_repl(
     opts: &NormalizeOptions,
     output: Option<&Path>,
     reject: Option<&Path>,
+    spec: OutputSpec,
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
@@ -288,10 +356,10 @@ fn run_repl(
         }
         collector.add_all(outs);
 
-        // 途中保存（中断しても残す）。
+        // 途中保存（中断しても残す）。選択された形式で上書き保存する。
         if let Some(p) = output {
             let mut w = BufWriter::new(File::create(p)?);
-            collector.write_dict(&mut w)?;
+            write_body(&collector, &mut w, spec)?;
             w.flush()?;
         }
         if let Some(p) = reject {
@@ -313,7 +381,7 @@ fn run_repl(
     if output.is_none() {
         let stdout = io::stdout();
         let mut w = stdout.lock();
-        collector.write_dict(&mut w)?;
+        write_body(&collector, &mut w, spec)?;
         w.flush()?;
     }
     Ok(())

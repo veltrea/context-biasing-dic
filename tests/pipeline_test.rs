@@ -106,3 +106,25 @@ fn end_to_end_collects_and_counts() {
     collector.write_dict(&mut buf).unwrap();
     assert_eq!(String::from_utf8(buf).unwrap(), "機械\n化学\n");
 }
+
+#[test]
+fn process_rows_includes_equal_and_replacements() {
+    use biasdiff::pipeline::{process_rows, RowOutcome};
+
+    let tk = MockTokenizer::new();
+    let opts = NormalizeOptions::loose();
+    let rows = process_rows(&tk, "今日は機械を学ぶ", "今日は機会を学ぶ", &opts).unwrap();
+
+    let equals = rows
+        .iter()
+        .filter(|r| matches!(r, RowOutcome::Equal { .. }))
+        .count();
+    let homophones = rows
+        .iter()
+        .filter(|r| matches!(r, RowOutcome::Homophone(_)))
+        .count();
+
+    // 今日/は/を/学ぶ は一致、機械→機会 は同音採用
+    assert!(equals >= 1, "expected at least one Equal row");
+    assert_eq!(homophones, 1);
+}

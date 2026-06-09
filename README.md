@@ -78,9 +78,25 @@ biasdiff batch \
 - The danger-word list goes to `--output` (or stdout if omitted), one word per
   line, sorted by frequency.
 - `--counts` appends the count as `word\tcount`.
+- `--format <txt|counts|amical-json>` picks the output shape (default `txt`).
+  `amical-json` writes a meta-tagged dictionary for the Amical voice-input app,
+  and `--field <label>` sets its field tag (default `general`). `--counts` is
+  kept for compatibility and equals `--format counts`; an explicit `--format`
+  wins when both are given.
 - Rejected (reading-mismatch) pairs go to `--reject` for later trend analysis.
 - A one-line summary is printed to stderr, so piping stdout gives you just the
   list.
+
+For the Amical dictionary, select `amical-json` and name the field:
+
+```sh
+biasdiff batch \
+  --reference ref.txt \
+  --hypothesis hyp.txt \
+  --format amical-json \
+  --field dev \
+  -o dev.biasing.json
+```
 
 ### Repl: the minimal read-aloud loop
 
@@ -101,7 +117,9 @@ not lost.
 | ----------------- | ------------------------------------------------------------- |
 | `--dict <ipadic\|unidic>` | Pick among the dictionaries embedded at build time.   |
 | `--strict`        | Disable reading-yure folding; require exact reading match.    |
-| `--counts`        | (batch) Emit `word\tcount` instead of bare words.            |
+| `--format <txt\|counts\|amical-json>` | Output shape (default `txt`). `amical-json` → Amical dictionary. |
+| `--field <label>` | Field tag for `amical-json` output (default `general`).       |
+| `--counts`        | (batch/repl) Emit `word\tcount`; same as `--format counts`.  |
 
 By default, readings are folded for long vowels, geminate (sokuon), dakuten,
 and small kana so that spelling variants of the same sound still match. `--strict`
@@ -111,6 +129,28 @@ turns that off.
 
 - **Danger-word list** — one reference-side word per line (with `--counts`,
   `word<TAB>count`). This is ready to feed into an ASR term list.
+- **Amical biasing dictionary (JSON)** — with `--format amical-json`, a single
+  JSON object the Amical voice-input app imports directly:
+
+  ```json
+  {
+    "schema": "amical-biasing-dictionary",
+    "version": 1,
+    "field": "dev",
+    "generator": "biasdiff 0.1.0",
+    "terms": [
+      { "word": "機械", "count": 12 },
+      { "word": "意思", "count": 5 }
+    ]
+  }
+  ```
+
+  `terms` is ordered by `count` descending (ties broken by `word` ascending) —
+  the same order as the plain list. Amical concatenates the words from the front
+  and truncates the tail to fit its context budget, so the most frequent words —
+  the ones most worth biasing — survive. Japanese is emitted as raw UTF-8 (never
+  `\uXXXX`), pretty-printed, with one trailing newline; an empty collection still
+  yields valid JSON with `"terms": []`.
 - **Reject log** — `reference<TAB>hypothesis<TAB>ref-reading<TAB>hyp-reading`,
   words and readings only (no sentences).
 

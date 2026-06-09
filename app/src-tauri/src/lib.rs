@@ -3,7 +3,7 @@
 
 use biasdiff::collect::Collector;
 use biasdiff::morph::{DictKind, LinderaTokenizer};
-use biasdiff::pipeline::process;
+use biasdiff::pipeline::{process_rows, Outcome, RowOutcome};
 use biasdiff::reading::NormalizeOptions;
 use serde::Serialize;
 use std::sync::Mutex;
@@ -25,24 +25,49 @@ struct PairDto {
     homophone: bool,
 }
 
-/// 危険語と出現回数。
+/// 危険語・読み・出現回数。
 #[derive(Serialize)]
 struct WordCountDto {
     word: String,
+    reading: String,
     count: usize,
 }
 
-/// `diff_pair` の結果。今回の置換ペアと、蓄積後の危険語リスト。
+/// 差分テーブルの1行。`kind` で Equal/Adopted/Rejected を判別する。
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum RowDto {
+    Equal {
+        surface: String,
+    },
+    Adopted {
+        reference: String,
+        hypothesis: String,
+        reading: String,
+    },
+    Rejected {
+        reference: String,
+        hypothesis: String,
+        reference_reading: String,
+        hypothesis_reading: String,
+    },
+}
+
+/// `diff_pair` の結果。今回の全 diff 行と、蓄積後の危険語リスト。
 #[derive(Serialize)]
 struct DiffResultDto {
-    pairs: Vec<PairDto>,
+    rows: Vec<RowDto>,
     danger_words: Vec<WordCountDto>,
 }
 
-fn to_word_counts(pairs: Vec<(String, usize)>) -> Vec<WordCountDto> {
-    pairs
+fn to_word_counts(entries: Vec<(String, String, usize)>) -> Vec<WordCountDto> {
+    entries
         .into_iter()
-        .map(|(word, count)| WordCountDto { word, count })
+        .map(|(word, reading, count)| WordCountDto {
+            word,
+            reading,
+            count,
+        })
         .collect()
 }
 
@@ -73,23 +98,41 @@ fn diff_pair(
     let ref_lines: Vec<&str> = reference.lines().collect();
     let hyp_lines: Vec<&str> = hypothesis.lines().collect();
 
-    let mut pairs = Vec::new();
+    let mut rows = Vec::new();
     let mut collector = state.collector.lock().map_err(|e| e.to_string())?;
 
     for (r, h) in ref_lines.iter().zip(hyp_lines.iter()) {
         if r.trim().is_empty() && h.trim().is_empty() {
             continue;
         }
-        let outs = process(&state.tokenizer, r, h, &opts).map_err(|e| e.to_string())?;
-        for o in &outs {
-            pairs.push(pair_dto(o.candidate(), o.is_homophone()));
+        let outcomes = process_rows(&state.tokenizer, r, h, &opts).map_err(|e| e.to_string())?;
+        for o in outcomes {
+            match o {
+                RowOutcome::Equal { surface } => rows.push(RowDto::Equal { surface }),
+                RowOutcome::Homophone(c) => {
+                    rows.push(RowDto::Adopted {
+                        reference: c.reference_surface.clone(),
+                        hypothesis: c.hypothesis_surface.clone(),
+                        reading: c.reference_reading.clone(),
+                    });
+                    collector.add(Outcome::Homophone(c));
+                }
+                RowOutcome::NonHomophone(c) => {
+                    rows.push(RowDto::Rejected {
+                        reference: c.reference_surface.clone(),
+                        hypothesis: c.hypothesis_surface.clone(),
+                        reference_reading: c.reference_reading.clone(),
+                        hypothesis_reading: c.hypothesis_reading.clone(),
+                    });
+                    collector.add(Outcome::NonHomophone(c));
+                }
+            }
         }
-        collector.add_all(outs);
     }
 
     Ok(DiffResultDto {
-        pairs,
-        danger_words: to_word_counts(collector.danger_words_sorted()),
+        rows,
+        danger_words: to_word_counts(collector.danger_entries_sorted()),
     })
 }
 
@@ -97,7 +140,7 @@ fn diff_pair(
 #[tauri::command]
 fn danger_words(state: State<AppState>) -> Result<Vec<WordCountDto>, String> {
     let collector = state.collector.lock().map_err(|e| e.to_string())?;
-    Ok(to_word_counts(collector.danger_words_sorted()))
+    Ok(to_word_counts(collector.danger_entries_sorted()))
 }
 
 /// 除外（読み不一致）ペア一覧。

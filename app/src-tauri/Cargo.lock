@@ -317,6 +317,8 @@ dependencies = [
  "anyhow",
  "clap",
  "lindera",
+ "serde",
+ "serde_json",
  "similar",
 ]
 

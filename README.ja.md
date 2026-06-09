@@ -73,8 +73,23 @@ biasdiff batch \
 
 - 危険語リストは `--output`（省略時は標準出力）へ、1 行 1 語、頻度順で出ます。
 - `--counts` を付けると `word\tcount` の形で回数を付けます。
+- `--format <txt|counts|amical-json>` で出力形式を選びます（既定 `txt`）。
+  `amical-json` は音声入力アプリ Amical がそのまま取り込めるメタ付き辞書を書き出し、
+  `--field <label>` でその分野ラベルを指定します（既定 `general`）。`--counts` は
+  後方互換として残り `--format counts` と同等です。両方を指定したときは `--format` を優先します。
 - 除外（読み不一致）ペアは `--reject` へ。後で傾向分析に使えます。
 - サマリは標準エラーへ出るので、標準出力をパイプすればリストだけが取れます。
+
+Amical 用辞書を出すときは `amical-json` を選び、分野名を付けます:
+
+```sh
+biasdiff batch \
+  --reference ref.txt \
+  --hypothesis hyp.txt \
+  --format amical-json \
+  --field dev \
+  -o dev.biasing.json
+```
 
 ### repl: 読み上げの最小ループ
 
@@ -94,7 +109,9 @@ biasdiff repl --output dict.txt
 | ----------------- | ------------------------------------------------------------- |
 | `--dict <ipadic\|unidic>` | ビルド時に埋め込んだ辞書から選ぶ。                    |
 | `--strict`        | 読みゆれの畳み込みを無効化し、読みの完全一致を要求する。      |
-| `--counts`        | (batch) 素の語ではなく `word\tcount` を出力する。            |
+| `--format <txt\|counts\|amical-json>` | 出力形式（既定 `txt`）。`amical-json` は Amical 用辞書。 |
+| `--field <label>` | `amical-json` 出力の分野ラベル（既定 `general`）。           |
+| `--counts`        | (batch/repl) `word\tcount` を出力。`--format counts` と同等。 |
 
 既定では、長音・促音・濁点・小書き仮名のゆれを畳み込み、同じ音の表記ゆれでも
 一致するようにします。`--strict` でこれを切ります。
@@ -103,6 +120,26 @@ biasdiff repl --output dict.txt
 
 - **危険語リスト** — 1 行 1 語（正解側の表記）。`--counts` 付きなら
   `word<TAB>count`。そのまま ASR の用語集に投入できます。
+- **Amical バイアシング辞書（JSON）** — `--format amical-json` を付けると、音声入力
+  アプリ Amical がそのまま取り込める 1 個の JSON オブジェクトを出します:
+
+  ```json
+  {
+    "schema": "amical-biasing-dictionary",
+    "version": 1,
+    "field": "dev",
+    "generator": "biasdiff 0.1.0",
+    "terms": [
+      { "word": "機械", "count": 12 },
+      { "word": "意思", "count": 5 }
+    ]
+  }
+  ```
+
+  `terms` は count 降順（同数は word 昇順）——プレーンなリストと同じ並びです。
+  Amical は語を先頭から連結し、文脈予算に収まるよう末尾を切り捨てるため、頻度の高い
+  ＝バイアスをかける価値の高い語ほど生き残ります。日本語は `\uXXXX` にせず生の UTF-8、
+  pretty 整形、末尾改行 1 個で出します。危険語が 0 件でも `"terms": []` の妥当な JSON になります。
 - **除外ログ** — `reference<TAB>hypothesis<TAB>ref-reading<TAB>hyp-reading`。
   語と読みのみ（文は含めない）。
 

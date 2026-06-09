@@ -6,7 +6,7 @@
 //!   2. 読みからして違う（滑舌・ノイズ由来）  → 辞書では直せない。除外して別ログへ。
 //! 読み（正規化後）の一致だけを採用条件にすることで、辞書の純度を保つ。
 
-use crate::diff::{extract_replacements, ReplacePair};
+use crate::diff::{diff_rows, extract_replacements, DiffRow, ReplacePair};
 use crate::reading::{normalize, NormalizeOptions};
 use crate::token::{Token, Tokenizer};
 
@@ -88,6 +88,43 @@ pub fn process(
     let hyp_tokens = tokenizer.tokenize(hypothesis_text)?;
     let pairs = extract_replacements(&ref_tokens, &hyp_tokens);
     Ok(pairs.iter().map(|p| classify(p, opts)).collect())
+}
+
+/// 行ごとの分類。Equal はそのまま、置換は同音/非同音に分ける（GUI 表示用）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowOutcome {
+    /// 一致行（連結表記）。
+    Equal { surface: String },
+    /// 採用：同音衝突。
+    Homophone(Candidate),
+    /// 除外：読み違い。
+    NonHomophone(Candidate),
+}
+
+fn classify_row(row: DiffRow, opts: &NormalizeOptions) -> RowOutcome {
+    match row {
+        DiffRow::Equal(tokens) => RowOutcome::Equal {
+            surface: tokens.iter().map(|t| t.surface.as_str()).collect(),
+        },
+        DiffRow::Replace(pair) => match classify(&pair, opts) {
+            Outcome::Homophone(c) => RowOutcome::Homophone(c),
+            Outcome::NonHomophone(c) => RowOutcome::NonHomophone(c),
+        },
+    }
+}
+
+/// 正解文と認識文を形態素解析し、一致行も含めた全行を分類して返す。
+/// `process` が置換ペアだけを返すのに対し、こちらは Equal 行も含む（GUI 用）。
+pub fn process_rows(
+    tokenizer: &dyn Tokenizer,
+    reference_text: &str,
+    hypothesis_text: &str,
+    opts: &NormalizeOptions,
+) -> anyhow::Result<Vec<RowOutcome>> {
+    let ref_tokens = tokenizer.tokenize(reference_text)?;
+    let hyp_tokens = tokenizer.tokenize(hypothesis_text)?;
+    let rows = diff_rows(&ref_tokens, &hyp_tokens);
+    Ok(rows.into_iter().map(|row| classify_row(row, opts)).collect())
 }
 
 #[cfg(test)]
