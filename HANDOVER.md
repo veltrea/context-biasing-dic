@@ -329,6 +329,41 @@ refs 無しエラー・plateau エッジ）。
 **次は Step 5**: 夜間自動回し（scripts/nightly-harvest.sh、WoL → SSH → 取り込み → shutdown、
 マシン固有情報はリポジトリ外）。GUI 統合は任意項目。
 
+#### Step 5 完了（2026-06-10）— 夜間自動回し（ローカル検証まで）
+
+**scripts/nightly-harvest.sh**: 全パラメータを `BIASDIFF_*` 環境変数で注入する汎用スクリプト
+（リポジトリにマシン固有情報なし）。`BIASDIFF_REMOTE_HOST` 未設定なら**ローカル実行**、
+設定時は WoL（`BIASDIFF_REMOTE_MAC`）→ SSH 疎通待ち（最大 3 分）→ リモートで自分自身を
+ローカルモード再帰実行 → `BIASDIFF_FETCH_TO` へ scp 取り込み → `BIASDIFF_SHUTDOWN=1` で
+shutdown（パスワードレス sudo 前提）。流れ: qiita + zenn 収穫 → 当日 counts を awk マージ →
+evaluate → `nightly/{日付}/`（dict.counts.tsv / curve.tsv / pruned.txt / 各ログ）。
+片ソース失敗は警告で続行（API 変更・レート制限で夜間全体を殺さない）。`nightly/` は git-ignore。
+
+**手動 1 回流し（ローカル、実記事 qiita 2 + zenn 2、話者 3 単独、4.5 分）**:
+- マージ辞書 23 語、評価 80 音声・320 認識・失敗 0
+- **実記事由来の自然セットでは衝突率カーブが単調減**: N=0: 0.325 → N=20: 0.200。
+  Step 4 の極端セットで見えた「N 増で悪化」は出ず、**現実条件で辞書が素直に効く**ことを確認
+- 「still improving at max-words」の診断どおり、23 語では頭打ちに達しない = 収穫を続けるほど
+  辞書が育つ余地がある（夜間回しの存在意義そのもの）
+- pruned には 型・WebView・スタック・テスタビリティ等の技術語が並ぶ（実際に衝突を直した語）。
+  一方 dict には「いえ・とき・ほう」級の一般語ノイズも残る — 多声投票（3 話者）と
+  頻度の積み上げで自然に沈む見込み。気になるなら将来「最低頻度」フィルタを検討
+
+**リモート運用（Mac mini M4）を始めるときの手順（未実施・次の宿題）**:
+1. Mac mini に VOICEVOX・`uv venv ~/.venvs/mlx-audio` + `uv pip install mlx-audio==0.4.4`・
+   リポジトリ clone・`cargo build --release --features harvest` を整える
+2. パスワードレス sudo（shutdown 用）を設定
+3. 開発機の launchd に毎晩のジョブを登録。例（`~/Library/LaunchAgents/com.biasdiff.nightly.plist`）:
+   ProgramArguments = [bash, -lc, "BIASDIFF_REMOTE_HOST='<user>@<mac-mini-ip>'
+   BIASDIFF_REMOTE_DIR='~/dev/context-biasing-dic' BIASDIFF_REMOTE_MAC='<mac-address>'
+   BIASDIFF_SSH_OPTS='-o ProxyJump=none -o IdentitiesOnly=yes -i ~/.ssh/id_ed25519'
+   BIASDIFF_FETCH_TO=$HOME/biasdiff-nightly BIASDIFF_SHUTDOWN=1
+   /path/to/repo/scripts/nightly-harvest.sh"]、StartCalendarInterval = {Hour: 3}
+   （**192.168.1.x への SSH は ProxyJump=none 必須** — CLAUDE.md の罠メモ参照）
+
+**v0.2 ロードマップ（Step 0〜5）はこれで完走。** 残る運用上の宿題: リモート常設、
+人間発話との突合（Q3 の継続検証、v0.1 repl と定期比較）、UniDic 切替の判断（Q4、除外ログ観察）。
+
 ---
 
 **作成**: 2026-06-10（前セッション）

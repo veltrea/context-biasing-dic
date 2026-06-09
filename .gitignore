@@ -13,6 +13,9 @@ Cargo.lock.orig
 # 決してコミットしない（SPEC §12・§15）。
 harvest_cache/
 
+# 夜間実行の成果物（日付別の辞書・カーブ・ログ）。生成物なのでコミットしない。
+/nightly/
+
 # デザインモック（Stitch 生成の中間素材）。実装は app/ にあり、project ID から再生成も可能なのでコミットしない。
 /design/
 
