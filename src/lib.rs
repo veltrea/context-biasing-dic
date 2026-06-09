@@ -16,6 +16,7 @@ pub mod token;
 
 // v0.2 harvest の抽象（純粋: 型とトレイトのみ、std で単体テスト可能）。
 // 実体アダプタは `harvest` feature の向こう側に置く（SPEC 4 章）。
+pub mod extract;
 pub mod recognize;
 pub mod source;
 pub mod synth;
@@ -39,6 +40,10 @@ pub mod ffmpeg;
 pub mod harvest;
 #[cfg(feature = "harvest")]
 pub mod source_file;
+#[cfg(feature = "harvest")]
+pub mod source_qiita;
+#[cfg(feature = "harvest")]
+pub mod source_zenn;
 #[cfg(feature = "harvest")]
 pub mod synth_say;
 #[cfg(feature = "harvest")]

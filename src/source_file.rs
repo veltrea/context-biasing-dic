@@ -36,4 +36,13 @@ impl TextSource for FileSource {
             body: Body::Plain(text),
         }])
     }
+
+    fn label(&self) -> &str {
+        "file"
+    }
+
+    /// 明示された入力は毎回フル処理（同じ入力 → 同じ辞書の再現を優先）。
+    fn dedup_across_runs(&self) -> bool {
+        false
+    }
 }

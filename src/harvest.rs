@@ -11,15 +11,17 @@
 //! 誤認しない。
 
 use crate::collect::Collector;
+use crate::extract::{self, ExtractOptions};
 use crate::pipeline::process;
 use crate::reading::NormalizeOptions;
 use crate::recognize::Recognizer;
-use crate::source::{Body, TextSource};
+use crate::source::TextSource;
 use crate::synth::{Synthesizer, VoiceSpec};
 use crate::token::Tokenizer;
 use crate::vote::{VoteBook, VoteSummary};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -56,7 +58,7 @@ pub struct HarvestOpts {
 pub struct HarvestReport {
     pub collector: Collector,
     pub vote: VoteSummary,
-    /// 例文化後の文数。
+    /// 例文化後の文数（seen によるスキップ適用後）。
     pub sentences: usize,
     /// 処理セル数（文 × 声）。
     pub cells: usize,
@@ -64,22 +66,64 @@ pub struct HarvestReport {
     pub asr_cache_hits: usize,
     /// 合成・認識に失敗して飛ばしたセル数（失敗は run 全体を止めない）。
     pub failures: usize,
+    /// seen.jsonl により処理を飛ばした記事数（実行間の重複排除）。
+    pub skipped_articles: usize,
+    /// seen.jsonl・実行内重複により飛ばした文数。
+    pub skipped_sentences: usize,
     /// dry-run のときだけ Some。例文化の結果。
     pub dry_run_sentences: Option<Vec<String>>,
+}
+
+/// 例文化済みの 1 記事分。記事の全文が処理し終わった時点で seen に記録する
+/// ため、記事と文の対応を保ったまま処理ループへ渡す。
+struct PendingArticle {
+    /// seen.jsonl のキー（`{label}/{id}`）。
+    key: String,
+    sentences: Vec<String>,
 }
 
 /// harvest 一周。
 pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
     let articles = deps.source.fetch(opts.count)?;
+    let dedup = deps.source.dedup_across_runs();
+    let label = deps.source.label();
 
-    // 文化。Step 1 は素朴な行分割。Step 2 で extract モジュール
-    // （構造除去・長さ/日本語率フィルタ・スコアリング・重複排除）に置き換える。
-    let mut sentences: Vec<String> = Vec::new();
+    // seen は dry-run でも読む（「実際に処理される文」を見せる）が、書くのは
+    // 実処理が完了した単位だけ。ファイルが無ければ空集合になるだけで、
+    // ここではキャッシュディレクトリを作らない。
+    let mut seen = Seen::load(&opts.cache_dir);
+
+    // 例文化（extract: 構造除去 → フィルタ → スコア → 記事内重複排除）に、
+    // 実行内の記事間重複と、seen による実行間重複の排除を重ねる。
+    let extract_opts = ExtractOptions::default();
+    let mut pending: Vec<PendingArticle> = Vec::new();
+    let mut in_run: BTreeSet<String> = BTreeSet::new();
+    let mut skipped_articles = 0usize;
+    let mut skipped_sentences = 0usize;
     for a in &articles {
-        sentences.extend(naive_sentences(&a.body));
+        let akey = format!("{}/{}", label, a.id);
+        if dedup && seen.has_article(&akey) {
+            skipped_articles += 1;
+            continue;
+        }
+        let mut kept: Vec<String> = Vec::new();
+        for s in extract::extract(&a.body, &extract_opts) {
+            let h = sentence_hash(&s);
+            if (dedup && seen.has_sentence(&h)) || !in_run.insert(h) {
+                skipped_sentences += 1;
+                continue;
+            }
+            kept.push(s);
+        }
+        pending.push(PendingArticle {
+            key: akey,
+            sentences: kept,
+        });
     }
+    let total: usize = pending.iter().map(|p| p.sentences.len()).sum();
 
     if opts.dry_run {
+        let sentences: Vec<String> = pending.into_iter().flat_map(|p| p.sentences).collect();
         return Ok(HarvestReport {
             collector: Collector::new(),
             vote: VoteSummary {
@@ -92,6 +136,8 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
             audio_cache_hits: 0,
             asr_cache_hits: 0,
             failures: 0,
+            skipped_articles,
+            skipped_sentences,
             dry_run_sentences: Some(sentences),
         });
     }
@@ -101,84 +147,107 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
     let mut audio_cache_hits = 0usize;
     let mut asr_cache_hits = 0usize;
     let mut failures = 0usize;
-    let total = sentences.len();
+    let mut done = 0usize;
 
-    for (i, sent) in sentences.iter().enumerate() {
-        for voice in &opts.voices {
-            let started = Instant::now();
-            // 音声: 内容アドレス（文 + エンジン + 話者 + 話速）。
-            let audio_key = content_key(&[sent, &voice.engine, &voice.voice, &voice.rate_key()]);
-            let audio_path = cache.audio_path(&audio_key);
-            let audio_was_cached = audio_path.exists();
-            if !audio_was_cached {
-                let part = part_path(&audio_path);
-                if let Err(e) = deps.synthesizer.synth(sent, voice, &part) {
-                    failures += 1;
-                    let _ = fs::remove_file(&part);
-                    eprintln!("warn: synth failed ({}): {e:#}", voice.speaker_key());
-                    continue;
-                }
-                fs::rename(&part, &audio_path)
-                    .with_context(|| format!("failed to move {} into cache", part.display()))?;
-            } else {
-                audio_cache_hits += 1;
-            }
-
-            // 認識: 音声キー + モデル名（モデルが違えば別の結果）。
-            let asr_key = content_key(&[&audio_key, &opts.asr_model]);
-            let asr_path = cache.asr_path(&asr_key);
-            let asr_was_cached = asr_path.exists();
-            let hypothesis = if asr_was_cached {
-                asr_cache_hits += 1;
-                fs::read_to_string(&asr_path)
-                    .with_context(|| format!("failed to read {}", asr_path.display()))?
-            } else {
-                match deps.recognizer.recognize(&audio_path, None) {
-                    Ok(h) => {
-                        let h = h.trim().to_string();
-                        let part = part_path(&asr_path);
-                        fs::write(&part, &h)
-                            .with_context(|| format!("failed to write {}", part.display()))?;
-                        fs::rename(&part, &asr_path)?;
-                        h
-                    }
-                    Err(e) => {
+    for article in &pending {
+        // seen への記録は「処理が失敗なく完了した単位」だけ。中断・失敗した
+        // 文/記事は次回も候補に残り、高価な部分はキャッシュが守る。
+        let mut article_complete = true;
+        for sent in &article.sentences {
+            done += 1;
+            let mut sentence_complete = true;
+            for voice in &opts.voices {
+                let started = Instant::now();
+                // 音声: 内容アドレス（文 + エンジン + 話者 + 話速）。
+                let audio_key =
+                    content_key(&[sent, &voice.engine, &voice.voice, &voice.rate_key()]);
+                let audio_path = cache.audio_path(&audio_key);
+                let audio_was_cached = audio_path.exists();
+                if !audio_was_cached {
+                    let part = part_path(&audio_path);
+                    if let Err(e) = deps.synthesizer.synth(sent, voice, &part) {
                         failures += 1;
-                        eprintln!("warn: asr failed ({}): {e:#}", audio_path.display());
+                        sentence_complete = false;
+                        let _ = fs::remove_file(&part);
+                        eprintln!("warn: synth failed ({}): {e:#}", voice.speaker_key());
                         continue;
                     }
+                    fs::rename(&part, &audio_path)
+                        .with_context(|| format!("failed to move {} into cache", part.display()))?;
                 }
-            };
 
-            // 既存コアへ。ASR は句読点を即興で挿入する（Step 0 実測: 「回答」が
-            // 「、解答」とアラインされ読み不一致扱いになった）ため、表記 diff の
-            // 前に両側から句読点を除いてアラインの崩れを防ぐ。
-            let outcomes = process(
-                deps.tokenizer,
-                &strip_punct(sent),
-                &strip_punct(&hypothesis),
-                &opts.normalize,
-            )?;
+                // 認識: 音声キー + モデル名（モデルが違えば別の結果）。
+                let asr_key = content_key(&[&audio_key, &opts.asr_model]);
+                let asr_path = cache.asr_path(&asr_key);
+                let asr_was_cached = asr_path.exists();
+                let hypothesis = if asr_was_cached {
+                    fs::read_to_string(&asr_path)
+                        .with_context(|| format!("failed to read {}", asr_path.display()))?
+                } else {
+                    match deps.recognizer.recognize(&audio_path, None) {
+                        Ok(h) => {
+                            let h = h.trim().to_string();
+                            let part = part_path(&asr_path);
+                            fs::write(&part, &h)
+                                .with_context(|| format!("failed to write {}", part.display()))?;
+                            fs::rename(&part, &asr_path)?;
+                            h
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            sentence_complete = false;
+                            eprintln!("warn: asr failed ({}): {e:#}", audio_path.display());
+                            continue;
+                        }
+                    }
+                };
+                if audio_was_cached {
+                    audio_cache_hits += 1;
+                }
+                if asr_was_cached {
+                    asr_cache_hits += 1;
+                }
 
-            if opts.verbose {
-                let adopted = outcomes.iter().filter(|o| o.is_homophone()).count();
-                let rejected = outcomes.len() - adopted;
-                eprintln!(
-                    "[{}/{}][{}@{}] audio={} asr={} {:.1}s [+]{} [-]{} | {}",
-                    i + 1,
-                    total,
-                    voice.speaker_key(),
-                    voice.rate_key(),
-                    if audio_was_cached { "cache" } else { "run" },
-                    if asr_was_cached { "cache" } else { "run" },
-                    started.elapsed().as_secs_f32(),
-                    adopted,
-                    rejected,
-                    sent,
-                );
+                // 既存コアへ。ASR は句読点を即興で挿入する（Step 0 実測: 「回答」が
+                // 「、解答」とアラインされ読み不一致扱いになった）ため、表記 diff の
+                // 前に両側から句読点を除いてアラインの崩れを防ぐ。
+                let outcomes = process(
+                    deps.tokenizer,
+                    &strip_punct(sent),
+                    &strip_punct(&hypothesis),
+                    &opts.normalize,
+                )?;
+
+                if opts.verbose {
+                    let adopted = outcomes.iter().filter(|o| o.is_homophone()).count();
+                    let rejected = outcomes.len() - adopted;
+                    eprintln!(
+                        "[{}/{}][{}@{}] audio={} asr={} {:.1}s [+]{} [-]{} | {}",
+                        done,
+                        total,
+                        voice.speaker_key(),
+                        voice.rate_key(),
+                        if audio_was_cached { "cache" } else { "run" },
+                        if asr_was_cached { "cache" } else { "run" },
+                        started.elapsed().as_secs_f32(),
+                        adopted,
+                        rejected,
+                        sent,
+                    );
+                }
+
+                book.record(&voice.speaker_key(), outcomes);
             }
-
-            book.record(&voice.speaker_key(), outcomes);
+            if sentence_complete {
+                if dedup {
+                    seen.record_sentence(&sentence_hash(sent))?;
+                }
+            } else {
+                article_complete = false;
+            }
+        }
+        if article_complete && dedup {
+            seen.record_article(&article.key)?;
         }
     }
 
@@ -193,21 +262,89 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
         audio_cache_hits,
         asr_cache_hits,
         failures,
+        skipped_articles,
+        skipped_sentences,
         dry_run_sentences: None,
     })
 }
 
-/// Step 1 の素朴な文化: 行で割って trim、空行を捨てる。
-/// 形式（Markdown/HTML）の構造除去は Step 2 の extract が担う。
-fn naive_sentences(body: &Body) -> Vec<String> {
-    let text = match body {
-        Body::Markdown(s) | Body::Html(s) | Body::Plain(s) => s,
-    };
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .map(String::from)
-        .collect()
+/// seen.jsonl に永続する文キー: 正規化（空白除去）後の SHA-256。
+/// std の `DefaultHasher` はバージョン間の安定保証がないため使わない。
+fn sentence_hash(s: &str) -> String {
+    content_key(&[&extract::normalize_sentence(s)])
+}
+
+/// 実行をまたいだ既処理の記録（SPEC 12 章の `seen.jsonl`）。
+///
+/// 1 行 1 JSON オブジェクト（`{"article":"qiita/abc"}` か
+/// `{"sentence":"<sha256>"}`）。壊れた行は黙って読み飛ばす — 記録の欠落は
+/// 「再処理される」方向にしか倒れず、キャッシュが高価な部分を守る。
+struct Seen {
+    path: PathBuf,
+    articles: BTreeSet<String>,
+    sentences: BTreeSet<String>,
+}
+
+impl Seen {
+    fn load(cache_dir: &Path) -> Self {
+        let path = cache_dir.join("seen.jsonl");
+        let mut articles = BTreeSet::new();
+        let mut sentences = BTreeSet::new();
+        if let Ok(text) = fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(a) = v.get("article").and_then(|x| x.as_str()) {
+                    articles.insert(a.to_string());
+                }
+                if let Some(s) = v.get("sentence").and_then(|x| x.as_str()) {
+                    sentences.insert(s.to_string());
+                }
+            }
+        }
+        Self {
+            path,
+            articles,
+            sentences,
+        }
+    }
+
+    fn has_article(&self, key: &str) -> bool {
+        self.articles.contains(key)
+    }
+
+    fn has_sentence(&self, hash: &str) -> bool {
+        self.sentences.contains(hash)
+    }
+
+    fn record_article(&mut self, key: &str) -> Result<()> {
+        if self.articles.insert(key.to_string()) {
+            self.append(&serde_json::json!({ "article": key }).to_string())?;
+        }
+        Ok(())
+    }
+
+    fn record_sentence(&mut self, hash: &str) -> Result<()> {
+        if self.sentences.insert(hash.to_string()) {
+            self.append(&serde_json::json!({ "sentence": hash }).to_string())?;
+        }
+        Ok(())
+    }
+
+    fn append(&self, line: &str) -> Result<()> {
+        use std::io::Write as _;
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        writeln!(f, "{line}")?;
+        Ok(())
+    }
 }
 
 /// 表記 diff の前処理: 全角句読点を除去する。
@@ -275,12 +412,19 @@ impl Cache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::Article;
+    use crate::source::{Article, Body};
     use crate::token::Token;
     use std::cell::Cell;
     use std::collections::HashMap;
 
-    /// 行を 1 記事にまとめて返すだけのソース。
+    // extract のフィルタ（20 字以上・日本語率・残骸なし）を通る素材。
+    // 械/会 は同音（カイ）、犬/猫 は読み違い（イヌ/ネコ）。
+    const REF_KAI: &str = "機械を実装して品質の確認を進める作業です";
+    const HYP_KAI: &str = "機会を実装して品質の確認を進める作業です";
+    const REF_INU: &str = "犬と猫を比較して品質の確認を進める作業です";
+    const HYP_INU: &str = "猫と猫を比較して品質の確認を進める作業です";
+
+    /// 行を 1 記事にまとめて返すだけのソース（ローカル入力相当・seen 不使用）。
     struct FixedSource(Vec<&'static str>);
 
     impl TextSource for FixedSource {
@@ -292,6 +436,36 @@ mod tests {
                 popularity: 0,
                 body: Body::Plain(self.0.join("\n")),
             }])
+        }
+
+        fn label(&self) -> &str {
+            "file"
+        }
+
+        fn dedup_across_runs(&self) -> bool {
+            false
+        }
+    }
+
+    /// ネットソース相当（dedup_across_runs = true・記事 id を指定できる）。
+    struct DedupSource {
+        id: &'static str,
+        text: &'static str,
+    }
+
+    impl TextSource for DedupSource {
+        fn fetch(&self, _n: usize) -> Result<Vec<Article>> {
+            Ok(vec![Article {
+                id: self.id.into(),
+                title: self.id.into(),
+                url: String::new(),
+                popularity: 0,
+                body: Body::Plain(self.text.into()),
+            }])
+        }
+
+        fn label(&self) -> &str {
+            "net"
         }
     }
 
@@ -398,10 +572,9 @@ mod tests {
     #[test]
     fn end_to_end_collects_homophone() {
         let dir = test_cache_dir("e2e");
-        let source = FixedSource(vec!["機械を実装", "犬を実装"]);
+        let source = FixedSource(vec![REF_KAI, REF_INU]);
         let synth = TextWritingSynth::new();
-        // 「械→会」は同音（カイ=カイ）、「犬→猫」は読み違い。
-        let rec = MappingRecognizer::new(&[("機械を実装", "機会を実装"), ("犬を実装", "猫を実装")]);
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI), (REF_INU, HYP_INU)]);
         let deps = HarvestDeps {
             source: &source,
             synthesizer: &synth,
@@ -429,8 +602,8 @@ mod tests {
     #[test]
     fn second_run_is_fully_cached_and_idempotent() {
         let dir = test_cache_dir("idempotent");
-        let source = FixedSource(vec!["機械を実装"]);
-        let rec_map = [("機械を実装", "機会を実装")];
+        let source = FixedSource(vec![REF_KAI]);
+        let rec_map = [(REF_KAI, HYP_KAI)];
 
         let first_words;
         {
@@ -450,7 +623,8 @@ mod tests {
             first_words = report.collector.danger_words_sorted();
         }
 
-        // 2 周目: 合成も認識も一度も呼ばれず、結果は同一（冪等）。
+        // 2 周目: ローカル入力（dedup なし）は全文が再処理対象になるが、
+        // 合成も認識もキャッシュ命中で一度も呼ばれず、結果は同一（冪等）。
         let synth = TextWritingSynth::new();
         let rec = MappingRecognizer::new(&rec_map);
         let deps = HarvestDeps {
@@ -460,6 +634,7 @@ mod tests {
             tokenizer: &CharTokenizer,
         };
         let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+        assert_eq!(report.sentences, 1);
         assert_eq!(synth.calls.get(), 0);
         assert_eq!(rec.calls.get(), 0);
         assert_eq!(report.audio_cache_hits, 1);
@@ -471,7 +646,8 @@ mod tests {
     #[test]
     fn dry_run_touches_no_engine() {
         let dir = test_cache_dir("dryrun");
-        let source = FixedSource(vec!["機械を実装", "", "  ", "犬を実装"]);
+        // 短い行は extract のフィルタで落ち、20 字以上の 2 文だけ残る。
+        let source = FixedSource(vec![REF_KAI, "短い行", REF_INU]);
         let synth = TextWritingSynth::new();
         let rec = MappingRecognizer::new(&[]);
         let deps = HarvestDeps {
@@ -487,12 +663,10 @@ mod tests {
 
         assert_eq!(synth.calls.get(), 0);
         assert_eq!(rec.calls.get(), 0);
-        // 空行・空白行は文に数えない。
         assert_eq!(report.sentences, 2);
-        assert_eq!(
-            report.dry_run_sentences,
-            Some(vec!["機械を実装".to_string(), "犬を実装".to_string()])
-        );
+        let got = report.dry_run_sentences.unwrap();
+        assert!(got.contains(&REF_KAI.to_string()));
+        assert!(got.contains(&REF_INU.to_string()));
         // dry-run はキャッシュディレクトリも作らない。
         assert!(!dir.exists());
     }
@@ -511,8 +685,8 @@ mod tests {
         }
 
         let dir = test_cache_dir("failure");
-        let source = FixedSource(vec!["機械を実装", "犬を実装"]);
-        let rec = MappingRecognizer::new(&[("機械を実装", "機会を実装")]);
+        let source = FixedSource(vec![REF_KAI, REF_INU]);
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
         let deps = HarvestDeps {
             source: &source,
             synthesizer: &FailingSynth,
@@ -530,9 +704,9 @@ mod tests {
     #[test]
     fn vote_threshold_drops_single_speaker_pairs() {
         let dir = test_cache_dir("vote");
-        let source = FixedSource(vec!["機械を実装"]);
+        let source = FixedSource(vec![REF_KAI]);
         let synth = TextWritingSynth::new();
-        let rec = MappingRecognizer::new(&[("機械を実装", "機会を実装")]);
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
         let deps = HarvestDeps {
             source: &source,
             synthesizer: &synth,
@@ -547,7 +721,7 @@ mod tests {
 
         // 2 話者構成なら同じペアが両話者で観測され、min_votes=2 を通る。
         let synth2 = TextWritingSynth::new();
-        let rec2 = MappingRecognizer::new(&[("機械を実装", "機会を実装")]);
+        let rec2 = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
         let deps2 = HarvestDeps {
             source: &source,
             synthesizer: &synth2,
@@ -561,6 +735,130 @@ mod tests {
         .unwrap();
         assert_eq!(report2.collector.danger_len(), 1);
         assert_eq!(report2.vote.passed_pairs, 1);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seen_skips_processed_article_on_second_run() {
+        let dir = test_cache_dir("seen-article");
+        let source = DedupSource {
+            id: "a1",
+            text: REF_KAI,
+        };
+
+        {
+            let synth = TextWritingSynth::new();
+            let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+            let deps = HarvestDeps {
+                source: &source,
+                synthesizer: &synth,
+                recognizer: &rec,
+                tokenizer: &CharTokenizer,
+            };
+            let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+            assert_eq!(report.collector.danger_len(), 1);
+            assert_eq!(report.skipped_articles, 0);
+        }
+
+        // 2 周目: 同じ記事 id は丸ごとスキップ。エンジンにもキャッシュにも触れない。
+        let synth = TextWritingSynth::new();
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+        let deps = HarvestDeps {
+            source: &source,
+            synthesizer: &synth,
+            recognizer: &rec,
+            tokenizer: &CharTokenizer,
+        };
+        let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+        assert_eq!(report.skipped_articles, 1);
+        assert_eq!(report.sentences, 0);
+        assert_eq!(synth.calls.get(), 0);
+        assert_eq!(rec.calls.get(), 0);
+        assert_eq!(report.collector.danger_len(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn seen_skips_same_sentence_from_different_article() {
+        let dir = test_cache_dir("seen-sentence");
+        {
+            let source = DedupSource {
+                id: "a1",
+                text: REF_KAI,
+            };
+            let synth = TextWritingSynth::new();
+            let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+            let deps = HarvestDeps {
+                source: &source,
+                synthesizer: &synth,
+                recognizer: &rec,
+                tokenizer: &CharTokenizer,
+            };
+            run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+        }
+
+        // 別 id の記事が同じ文を含む（トレンドの転載・テンプレ文相当）→ 文単位で弾く。
+        let source = DedupSource {
+            id: "a2",
+            text: REF_KAI,
+        };
+        let synth = TextWritingSynth::new();
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+        let deps = HarvestDeps {
+            source: &source,
+            synthesizer: &synth,
+            recognizer: &rec,
+            tokenizer: &CharTokenizer,
+        };
+        let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+        assert_eq!(report.skipped_articles, 0);
+        assert_eq!(report.skipped_sentences, 1);
+        assert_eq!(report.sentences, 0);
+        assert_eq!(synth.calls.get(), 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_sentence_is_not_marked_seen_and_retries() {
+        struct FailingSynth;
+        impl Synthesizer for FailingSynth {
+            fn synth(&self, _text: &str, _voice: &VoiceSpec, _out: &Path) -> Result<()> {
+                anyhow::bail!("engine down")
+            }
+        }
+
+        let dir = test_cache_dir("seen-retry");
+        let source = DedupSource {
+            id: "a1",
+            text: REF_KAI,
+        };
+
+        {
+            // 1 周目: 合成が全滅 → 文は seen に記録されない。
+            let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+            let deps = HarvestDeps {
+                source: &source,
+                synthesizer: &FailingSynth,
+                recognizer: &rec,
+                tokenizer: &CharTokenizer,
+            };
+            let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+            assert_eq!(report.failures, 1);
+            assert_eq!(report.collector.danger_len(), 0);
+        }
+
+        // 2 周目: エンジンが直れば同じ文が再処理され、収穫される。
+        let synth = TextWritingSynth::new();
+        let rec = MappingRecognizer::new(&[(REF_KAI, HYP_KAI)]);
+        let deps = HarvestDeps {
+            source: &source,
+            synthesizer: &synth,
+            recognizer: &rec,
+            tokenizer: &CharTokenizer,
+        };
+        let report = run(&deps, &opts(dir.clone(), vec![voice("mock", "a")], 1)).unwrap();
+        assert_eq!(report.skipped_sentences, 0);
+        assert_eq!(report.collector.danger_len(), 1);
         let _ = fs::remove_dir_all(&dir);
     }
 

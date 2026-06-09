@@ -20,6 +20,8 @@ use crate::{
     recognize::Recognizer,
     source::TextSource,
     source_file::FileSource,
+    source_qiita::QiitaSource,
+    source_zenn::ZennSource,
     synth::{Synthesizer, VoiceSpec},
     synth_say::SaySynth,
     synth_voicevox::VoicevoxSynth,
@@ -93,12 +95,21 @@ enum Command {
     /// 自動収穫：取得 → TTS → ASR → diff → 辞書（v0.2、要 --features harvest）。
     #[cfg(feature = "harvest")]
     Harvest {
-        /// テキストソース。Step 1 は file のみ（qiita / zenn は Step 2）。
+        /// テキストソース（file | qiita | zenn）。
         #[arg(long, default_value = "file")]
         source: String,
-        /// file ソースの入力テキスト（1 行 1 文）。
+        /// file ソースの入力テキスト（file のとき必須）。
         #[arg(long)]
-        input: PathBuf,
+        input: Option<PathBuf>,
+        /// qiita ソースの検索クエリ。
+        #[arg(long, default_value = "stocks:>=50 tag:rust")]
+        query: String,
+        /// zenn ソースのトピック名。
+        #[arg(long, default_value = "rust")]
+        topic: String,
+        /// zenn ソースの並び順（daily | weekly | monthly など）。
+        #[arg(long, default_value = "weekly")]
+        order: String,
         /// ソースから取得する記事数の上限。
         #[arg(long, default_value_t = 100)]
         count: usize,
@@ -267,6 +278,9 @@ pub fn run() -> Result<()> {
         Command::Harvest {
             source,
             input,
+            query,
+            topic,
+            order,
             count,
             tts,
             voicevox_url,
@@ -291,6 +305,9 @@ pub fn run() -> Result<()> {
             let args = HarvestArgs {
                 source,
                 input,
+                query,
+                topic,
+                order,
                 count,
                 tts,
                 voicevox_url,
@@ -319,7 +336,10 @@ pub fn run() -> Result<()> {
 #[cfg(feature = "harvest")]
 struct HarvestArgs {
     source: String,
-    input: PathBuf,
+    input: Option<PathBuf>,
+    query: String,
+    topic: String,
+    order: String,
     count: usize,
     tts: String,
     voicevox_url: String,
@@ -343,12 +363,30 @@ fn run_harvest(
     reject: Option<&Path>,
     spec: OutputSpec,
 ) -> Result<()> {
-    // ソース。Step 1 は file のみ（qiita / zenn は Step 2 で追加）。
+    // ソース。qiita / zenn は受信専用の公開記事取得（SPEC 15 章）。
     let source: Box<dyn TextSource> = match args.source.as_str() {
-        "file" => Box::new(FileSource::new(&args.input)),
+        "file" => {
+            let Some(input) = &args.input else {
+                anyhow::bail!(msg!(
+                    "--source file requires --input <path>",
+                    "--source file には --input <パス> が必要です",
+                ));
+            };
+            Box::new(FileSource::new(input))
+        }
+        "qiita" => Box::new(QiitaSource {
+            query: args.query.clone(),
+            token: std::env::var("QIITA_TOKEN").ok().filter(|t| !t.is_empty()),
+            cache_dir: args.cache_dir.clone(),
+        }),
+        "zenn" => Box::new(ZennSource {
+            topic: args.topic.clone(),
+            order: args.order.clone(),
+            cache_dir: args.cache_dir.clone(),
+        }),
         other => anyhow::bail!(msg!(
-            format!("source '{other}' is not implemented yet (only 'file' for now)"),
-            format!("ソース '{other}' は未実装です（現在は 'file' のみ）"),
+            format!("unknown source '{other}' (file | qiita | zenn)"),
+            format!("ソース '{other}' は未対応です（file | qiita | zenn）"),
         )),
     };
 

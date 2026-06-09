@@ -33,4 +33,18 @@ pub enum Body {
 /// 候補記事を取得する。`n` はソースごとの記事数上限。
 pub trait TextSource {
     fn fetch(&self, n: usize) -> anyhow::Result<Vec<Article>>;
+
+    /// ソースの表示名。キャッシュと seen.jsonl のキー空間になる
+    /// （"file" | "qiita" | "zenn"）。
+    fn label(&self) -> &str;
+
+    /// 実行をまたぐ重複排除（seen.jsonl）を適用するか。
+    ///
+    /// ネット由来のソースは true — トレンド記事は日をまたいで再登場するため、
+    /// 処理済みの記事・文を弾いて日次増分にする。ローカルファイルは false —
+    /// ユーザーが明示した入力は毎回フルに処理し、同じ入力から同じ辞書が
+    /// 再現できることを優先する。
+    fn dedup_across_runs(&self) -> bool {
+        true
+    }
 }
