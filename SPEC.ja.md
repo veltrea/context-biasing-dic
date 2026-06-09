@@ -169,9 +169,12 @@ pub struct VoiceSpec {
     pub rate: f32,        // 1.0 = engine default
 }
 
-/// Synthesizes one sentence into an audio file (16 kHz mono WAV).
+/// Synthesizes one sentence into `out` (16 kHz mono WAV). The orchestrator
+/// chooses `out` — the content-addressed cache slot — so adapters carry no
+/// cache knowledge.
 pub trait Synthesizer {
-    fn synth(&self, text: &str, voice: &VoiceSpec) -> anyhow::Result<std::path::PathBuf>;
+    fn synth(&self, text: &str, voice: &VoiceSpec, out: &std::path::Path)
+        -> anyhow::Result<()>;
 }
 
 /// Transcribes an audio file. `bias` carries dictionary words for context
@@ -305,14 +308,18 @@ GET https://zenn.dev/api/articles/{slug}
 harvest_cache/
   articles/{source}/{id}.json   # fetched articles (API not hit again on re-run)
   seen.jsonl                    # processed article ids + sentence hashes
-  audio/{sha256(text|voice|rate|engine)}.wav   # TTS output (most expensive asset)
-  asr/{same-hash}.txt           # recognition results (without bias)
+  audio/{sha256(text|engine|voice|rate)}.wav   # TTS output (most expensive asset)
+  asr/{sha256(audio-key|model)}.txt   # recognition results (without bias);
+                                      # the model name is part of the key, so
+                                      # switching models never reuses stale text
   asr-biased/{hash}/{n}.txt     # recognition results under top-N biasing
 ```
 
 音声と認識結果は内容アドレスで管理する。`harvest` の中断・再実行や、同じ
 音声セットへの `evaluate` の繰り返しが、ディスク上にあるものを再合成・
-再認識することはない。`--cache-dir` の既定は `./harvest_cache` で、より速い
+再認識することはない。認識結果のキーにはモデル名が入るため、モデルを
+切り替えても古い結果を流用しない。書き込みは一時ファイル + rename で行い、
+中断による半端なファイルがキャッシュ命中と誤認されることもない。`--cache-dir` の既定は `./harvest_cache` で、より速い
 ディスクを指してもよい。キャッシュディレクトリは git-ignore する —
 記事本文を含むため、決してコミットしてはならない。
 

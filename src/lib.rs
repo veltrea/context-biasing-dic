@@ -14,6 +14,13 @@ pub mod pipeline;
 pub mod reading;
 pub mod token;
 
+// v0.2 harvest の抽象（純粋: 型とトレイトのみ、std で単体テスト可能）。
+// 実体アダプタは `harvest` feature の向こう側に置く（SPEC 4 章）。
+pub mod recognize;
+pub mod source;
+pub mod synth;
+pub mod vote;
+
 // Lindera バックエンドと UI（feature gated）。辞書を埋め込んだときだけコンパイルされる。
 #[cfg(feature = "_lindera")]
 pub mod cli;
@@ -21,3 +28,18 @@ pub mod cli;
 pub mod messages;
 #[cfg(feature = "_lindera")]
 pub mod morph;
+
+// v0.2 harvest のオーケストレーションとアダプタ（feature gated）。
+// 外部エンジン（VOICEVOX / say / ffmpeg / Qwen3-ASR）へはここからだけ触れる。
+#[cfg(feature = "harvest")]
+pub mod asr_qwen3_mlx;
+#[cfg(feature = "harvest")]
+pub mod ffmpeg;
+#[cfg(feature = "harvest")]
+pub mod harvest;
+#[cfg(feature = "harvest")]
+pub mod source_file;
+#[cfg(feature = "harvest")]
+pub mod synth_say;
+#[cfg(feature = "harvest")]
+pub mod synth_voicevox;

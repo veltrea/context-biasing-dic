@@ -174,6 +174,46 @@ cargo run --release -- repl
 
 **検証用作業ファイル**: `/tmp/biasdiff-step0/`（sentences.txt / hypothesis*.txt / reject*.txt。/tmp なので揮発）
 
+#### Step 1 完了（2026-06-10）— トレイト 3 種 + 最小 harvest（FileSource）
+
+**完了条件を満たした**: `biasdiff harvest --source file --input sentences.txt --tts voicevox --asr qwen3-mlx` の
+1 コマンドで file → TTS → ASR → 既存コア（無改造）→ amical-json が通り、再実行が冪等。
+
+**実測（10 文・VOICEVOX 話者 3・0.6B）**:
+- 一周目 29.2 秒（cold）→ **二周目 0.025 秒**（キャッシュ全命中 audio 10/10・asr 10/10、出力完全一致）
+- 危険語 **9 語**: Step 0 の手動 batch（8 語）より 1 語多い。差分は「回答←解答」—
+  diff 前の**全角句読点除去**（harvest.rs の `strip_punct`、Step 0 の学び 2 への対処）で
+  ASR の挿入読点によるアライン崩れが消えたため。除外 4 件（機械/非会ほか、フェイルセーフ動作）
+
+**Q2 本計測（同 10 文を両モデルで）**:
+- 0.6B: 危険語 9、ASR 約 2.2 秒/文 ／ 1.7B: 危険語 10（**偽陽性「データ移行←低代号」込み**）、約 2.3 秒/文
+- どちらもモデルロード支配で速度差は誤差。1.7B が一様に良いわけではない（文 5 は 1.7B の方が派手に崩壊）
+- → **既定 0.6B 維持で確定**。バッチドライバ（SPEC §9、モデル 1 回ロード）は今後も価値あり
+
+**実装の設計判断（SPEC へ反映済み・英日同期)**:
+- `Synthesizer::synth(text, voice, out: &Path)` — 出力先（内容アドレスのキャッシュ位置）は
+  オーケストレータが決めて渡す。アダプタにキャッシュの知識を持ち込まない（SPEC §5 更新）
+- ASR キャッシュキー = `sha256(audio-key | model)` — モデル切り替えで古い結果を流用しない
+  （SPEC §12 更新。Q2 計測がこの設計の実地検証になった: 1.7B 実行時 audio 10/10 命中・asr 0/10）
+- キャッシュ書き込みは一時ファイル（`.part`）+ rename。中断の半端ファイルを命中と誤認しない
+- 投票（vote.rs）は Step 1 から実装済み（min_votes=1 でパススルー）。NonHomophone は投票対象外で素通し
+
+**実環境で見つけたバグ（モックでは不可視・記録に値する）**:
+- ffmpeg は**出力ファイルの拡張子**からフォーマットを推定するため、`.part` 一時パスへの出力が
+  「Unable to choose an output format」で全滅した。`-f wav` 明示で解決（ffmpeg.rs）。
+  教訓: subprocess 系アダプタの統合は実エンジンで一周してから信用する
+
+**テスト**: default 28 / harvest 35 全通過（既存コアのテストは素通り = 無改造の証明）。
+`#[ignore]` 統合テスト 2 本も実エンジン（VOICEVOX + venv）で通過。実行方法:
+`source ~/.venvs/mlx-audio/bin/activate && cargo test --features harvest -- --ignored`
+
+**使い方メモ**: venv を activate してから実行すれば `--asr-python` 省略可（既定 python3 が venv を指す）。
+dry-run は VOICEVOX 不在でも動く（疎通確認をスキップ）。`--min-votes` 省略時は話者 2 以上の構成で 2、
+それ以外 1（SPEC §11 の既定）。
+
+**次は Step 2**: `extract`（テストファースト・例文化の品質 = 辞書の純度）+ QiitaSource / ZennSource +
+`articles/{source}/{id}.json` / `seen.jsonl` キャッシュ + `--dry-run` の本領発揮。
+
 ---
 
 **作成**: 2026-06-10（前セッション）

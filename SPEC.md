@@ -171,9 +171,12 @@ pub struct VoiceSpec {
     pub rate: f32,        // 1.0 = engine default
 }
 
-/// Synthesizes one sentence into an audio file (16 kHz mono WAV).
+/// Synthesizes one sentence into `out` (16 kHz mono WAV). The orchestrator
+/// chooses `out` — the content-addressed cache slot — so adapters carry no
+/// cache knowledge.
 pub trait Synthesizer {
-    fn synth(&self, text: &str, voice: &VoiceSpec) -> anyhow::Result<std::path::PathBuf>;
+    fn synth(&self, text: &str, voice: &VoiceSpec, out: &std::path::Path)
+        -> anyhow::Result<()>;
 }
 
 /// Transcribes an audio file. `bias` carries dictionary words for context
@@ -312,14 +315,18 @@ cannot create dictionary entries on their own. Voting happens before
 harvest_cache/
   articles/{source}/{id}.json   # fetched articles (API not hit again on re-run)
   seen.jsonl                    # processed article ids + sentence hashes
-  audio/{sha256(text|voice|rate|engine)}.wav   # TTS output (most expensive asset)
-  asr/{same-hash}.txt           # recognition results (without bias)
+  audio/{sha256(text|engine|voice|rate)}.wav   # TTS output (most expensive asset)
+  asr/{sha256(audio-key|model)}.txt   # recognition results (without bias);
+                                      # the model name is part of the key, so
+                                      # switching models never reuses stale text
   asr-biased/{hash}/{n}.txt     # recognition results under top-N biasing
 ```
 
 Audio and recognitions are content-addressed; interrupting `harvest`, or
 running `evaluate` many times over the same audio set, never re-synthesizes or
-re-recognizes anything already on disk. `--cache-dir` defaults to
+re-recognizes anything already on disk. Writes go through a temp file +
+rename, so an interrupted run cannot leave a truncated file that would later
+be mistaken for a cache hit. `--cache-dir` defaults to
 `./harvest_cache` and may point at a faster disk. The cache directory is
 git-ignored — it contains article bodies and must never be committed.
 

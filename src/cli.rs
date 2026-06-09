@@ -13,6 +13,18 @@ use std::fs::{self, File};
 use std::io::{self, BufRead, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(feature = "harvest")]
+use crate::{
+    asr_qwen3_mlx::Qwen3MlxRecognizer,
+    harvest::{self, HarvestDeps, HarvestOpts},
+    recognize::Recognizer,
+    source::TextSource,
+    source_file::FileSource,
+    synth::{Synthesizer, VoiceSpec},
+    synth_say::SaySynth,
+    synth_voicevox::VoicevoxSynth,
+};
+
 #[derive(Parser)]
 #[command(
     name = "biasdiff",
@@ -72,6 +84,64 @@ enum Command {
         #[arg(long, value_enum)]
         format: Option<OutputFormat>,
         /// 後方互換: `--format counts` と同等（`語\t回数`）。`--format` 明示時はそちらを優先。
+        #[arg(long)]
+        counts: bool,
+        /// `amical-json` 出力時の分野ラベル（JSON の `field`）。
+        #[arg(long, default_value = "general")]
+        field: String,
+    },
+    /// 自動収穫：取得 → TTS → ASR → diff → 辞書（v0.2、要 --features harvest）。
+    #[cfg(feature = "harvest")]
+    Harvest {
+        /// テキストソース。Step 1 は file のみ（qiita / zenn は Step 2）。
+        #[arg(long, default_value = "file")]
+        source: String,
+        /// file ソースの入力テキスト（1 行 1 文）。
+        #[arg(long)]
+        input: PathBuf,
+        /// ソースから取得する記事数の上限。
+        #[arg(long, default_value_t = 100)]
+        count: usize,
+        /// TTS エンジン（voicevox | say）。
+        #[arg(long, default_value = "voicevox")]
+        tts: String,
+        /// VOICEVOX エンジンの URL。
+        #[arg(long, default_value = "http://127.0.0.1:50021")]
+        voicevox_url: String,
+        /// 話者（カンマ区切り）。voicevox は speaker id、say は声名（Kyoko 等）。
+        #[arg(long, value_delimiter = ',', default_value = "3")]
+        voices: Vec<String>,
+        /// 話速倍率（カンマ区切り。1.0 = エンジン既定）。
+        #[arg(long, value_delimiter = ',', default_value = "1.0")]
+        rates: Vec<f32>,
+        /// ASR エンジン（qwen3-mlx のみ）。
+        #[arg(long, default_value = "qwen3-mlx")]
+        asr: String,
+        /// ASR モデル。
+        #[arg(long, default_value = "mlx-community/Qwen3-ASR-0.6B-8bit")]
+        model: String,
+        /// mlx-audio が入った環境の python（venv を activate して起動すれば既定で可）。
+        #[arg(long, default_value = "python3")]
+        asr_python: PathBuf,
+        /// キャッシュディレクトリ（音声・認識結果。git 管理外）。
+        #[arg(long, default_value = "./harvest_cache")]
+        cache_dir: PathBuf,
+        /// 採用に必要な異なり話者数。省略時: 話者 2 以上の構成なら 2、それ以外は 1。
+        #[arg(long)]
+        min_votes: Option<usize>,
+        /// 例文化で止めて文を表示する（TTS / ASR を回さない）。
+        #[arg(long)]
+        dry_run: bool,
+        /// 危険語リストの出力先（省略時は標準出力）。
+        #[arg(long, short)]
+        output: Option<PathBuf>,
+        /// 読み不一致ペアの別ログ出力先。
+        #[arg(long)]
+        reject: Option<PathBuf>,
+        /// 出力形式（txt=語のみ / counts=`語\t回数` / amical-json=Amical 取り込み用 JSON）。
+        #[arg(long, value_enum)]
+        format: Option<OutputFormat>,
+        /// 後方互換: `--format counts` と同等。
         #[arg(long)]
         counts: bool,
         /// `amical-json` 出力時の分野ラベル（JSON の `field`）。
@@ -193,7 +263,247 @@ pub fn run() -> Result<()> {
             };
             run_repl(&tokenizer, &opts, output.as_deref(), reject.as_deref(), spec)
         }
+        #[cfg(feature = "harvest")]
+        Command::Harvest {
+            source,
+            input,
+            count,
+            tts,
+            voicevox_url,
+            voices,
+            rates,
+            asr,
+            model,
+            asr_python,
+            cache_dir,
+            min_votes,
+            dry_run,
+            output,
+            reject,
+            format,
+            counts,
+            field,
+        } => {
+            let spec = OutputSpec {
+                format: resolve_format(format, counts),
+                field: &field,
+            };
+            let args = HarvestArgs {
+                source,
+                input,
+                count,
+                tts,
+                voicevox_url,
+                voices,
+                rates,
+                asr,
+                model,
+                asr_python,
+                cache_dir,
+                min_votes,
+                dry_run,
+            };
+            run_harvest(
+                &tokenizer,
+                &opts,
+                args,
+                output.as_deref(),
+                reject.as_deref(),
+                spec,
+            )
+        }
     }
+}
+
+/// `harvest` の CLI 引数（出力系を除く）。`run_harvest` の引数を束ねる。
+#[cfg(feature = "harvest")]
+struct HarvestArgs {
+    source: String,
+    input: PathBuf,
+    count: usize,
+    tts: String,
+    voicevox_url: String,
+    voices: Vec<String>,
+    rates: Vec<f32>,
+    asr: String,
+    model: String,
+    asr_python: PathBuf,
+    cache_dir: PathBuf,
+    min_votes: Option<usize>,
+    dry_run: bool,
+}
+
+/// 自動収穫一周。アダプタを組み立て、オーケストレーション（`harvest::run`）へ。
+#[cfg(feature = "harvest")]
+fn run_harvest(
+    tokenizer: &LinderaTokenizer,
+    opts: &NormalizeOptions,
+    args: HarvestArgs,
+    output: Option<&Path>,
+    reject: Option<&Path>,
+    spec: OutputSpec,
+) -> Result<()> {
+    // ソース。Step 1 は file のみ（qiita / zenn は Step 2 で追加）。
+    let source: Box<dyn TextSource> = match args.source.as_str() {
+        "file" => Box::new(FileSource::new(&args.input)),
+        other => anyhow::bail!(msg!(
+            format!("source '{other}' is not implemented yet (only 'file' for now)"),
+            format!("ソース '{other}' は未実装です（現在は 'file' のみ）"),
+        )),
+    };
+
+    // TTS。VOICEVOX は最初に疎通を確かめ、つながらないなら文を処理する前に止まる
+    // （dry-run はエンジンに触れないので確認しない — VOICEVOX 不在でも使える）。
+    let synthesizer: Box<dyn Synthesizer> = match args.tts.as_str() {
+        "voicevox" => {
+            let s = VoicevoxSynth::new(args.voicevox_url.clone());
+            if !args.dry_run {
+                let version = s.check()?;
+                eprintln!(
+                    "{}",
+                    msg!(
+                        format!("VOICEVOX {} at {}", version, args.voicevox_url),
+                        format!("VOICEVOX {}（{}）", version, args.voicevox_url),
+                    )
+                );
+            }
+            Box::new(s)
+        }
+        "say" => Box::new(SaySynth),
+        other => anyhow::bail!(msg!(
+            format!("unknown TTS engine '{other}' (voicevox | say)"),
+            format!("TTS エンジン '{other}' は未対応です（voicevox | say）"),
+        )),
+    };
+
+    let recognizer: Box<dyn Recognizer> = match args.asr.as_str() {
+        "qwen3-mlx" => Box::new(Qwen3MlxRecognizer::new(&args.asr_python, args.model.clone())),
+        other => anyhow::bail!(msg!(
+            format!("unknown ASR engine '{other}' (qwen3-mlx)"),
+            format!("ASR エンジン '{other}' は未対応です（qwen3-mlx）"),
+        )),
+    };
+
+    // 声マトリクス（話者 × 話速）。
+    let mut voice_specs: Vec<VoiceSpec> = Vec::new();
+    for v in &args.voices {
+        for r in &args.rates {
+            voice_specs.push(VoiceSpec {
+                engine: args.tts.clone(),
+                voice: v.clone(),
+                rate: *r,
+            });
+        }
+    }
+
+    // min-votes の既定（SPEC 11 章): 異なり話者 2 以上の構成なら 2、それ以外は 1。
+    let distinct_speakers: std::collections::BTreeSet<String> =
+        voice_specs.iter().map(|v| v.speaker_key()).collect();
+    let min_votes = args
+        .min_votes
+        .unwrap_or(if distinct_speakers.len() >= 2 { 2 } else { 1 });
+
+    let deps = HarvestDeps {
+        source: source.as_ref(),
+        synthesizer: synthesizer.as_ref(),
+        recognizer: recognizer.as_ref(),
+        tokenizer,
+    };
+    let hopts = HarvestOpts {
+        count: args.count,
+        voices: voice_specs,
+        min_votes,
+        cache_dir: args.cache_dir,
+        normalize: *opts,
+        asr_model: args.model,
+        dry_run: args.dry_run,
+        verbose: true,
+    };
+
+    let report = harvest::run(&deps, &hopts)?;
+
+    // dry-run: 例文を標準出力へ出して終わり（パイプで覗ける）。
+    if let Some(sentences) = report.dry_run_sentences {
+        for s in &sentences {
+            println!("{}", s);
+        }
+        eprintln!(
+            "{}",
+            msg!(
+                format!("{} sentence(s) extracted (dry run).", sentences.len()),
+                format!("例文 {} 文を抽出しました（dry run）。", sentences.len()),
+            )
+        );
+        return Ok(());
+    }
+
+    emit_dict(&report.collector, output, spec)?;
+
+    if let Some(p) = reject {
+        let mut w = BufWriter::new(
+            File::create(p).with_context(|| format!("failed to create {}", p.display()))?,
+        );
+        report.collector.write_reject(&mut w)?;
+        w.flush()?;
+    }
+
+    // 統計は stderr へ（標準出力の辞書をパイプで汚さない）。
+    eprintln!(
+        "{}",
+        msg!(
+            format!(
+                "done: {} sentence(s) x {} voice(s), cache hits audio {}/{} asr {}/{}, {} failure(s).",
+                report.sentences,
+                if report.sentences == 0 { 0 } else { report.cells / report.sentences },
+                report.audio_cache_hits,
+                report.cells,
+                report.asr_cache_hits,
+                report.cells,
+                report.failures
+            ),
+            format!(
+                "処理: {} 文 × {} 声、キャッシュ命中 音声 {}/{} 認識 {}/{}、失敗 {} 件。",
+                report.sentences,
+                if report.sentences == 0 { 0 } else { report.cells / report.sentences },
+                report.audio_cache_hits,
+                report.cells,
+                report.asr_cache_hits,
+                report.cells,
+                report.failures
+            ),
+        )
+    );
+    if report.vote.dropped_pairs > 0 {
+        eprintln!(
+            "{}",
+            msg!(
+                format!(
+                    "vote: {} pair(s) adopted, {} dropped (fewer than {} distinct speakers).",
+                    report.vote.passed_pairs, report.vote.dropped_pairs, min_votes
+                ),
+                format!(
+                    "投票: 採用 {} ペア、棄却 {} ペア（異なり話者 {} 未満）。",
+                    report.vote.passed_pairs, report.vote.dropped_pairs, min_votes
+                ),
+            )
+        );
+    }
+    eprintln!(
+        "{}",
+        msg!(
+            format!(
+                "done: {} danger word(s), {} rejected pair(s).",
+                report.collector.danger_len(),
+                report.collector.reject_pairs().len()
+            ),
+            format!(
+                "完了: 危険語 {} 語、除外ペア {} 件。",
+                report.collector.danger_len(),
+                report.collector.reject_pairs().len()
+            ),
+        )
+    );
+    Ok(())
 }
 
 /// 正解文・認識文ファイルを行対応で照合する。

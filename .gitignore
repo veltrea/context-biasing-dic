@@ -9,6 +9,10 @@ Cargo.lock.orig
 /reject.txt
 /out/
 
+# harvest のキャッシュ。取得した記事本文・生成音声・認識結果を含むため
+# 決してコミットしない（SPEC §12・§15）。
+harvest_cache/
+
 # デザインモック（Stitch 生成の中間素材）。実装は app/ にあり、project ID から再生成も可能なのでコミットしない。
 /design/
 

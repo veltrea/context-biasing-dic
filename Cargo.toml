@@ -27,6 +27,9 @@ ipadic = ["_lindera", "lindera/embed-ipadic"]
 unidic = ["_lindera", "lindera/embed-unidic"]
 # 内部用: Lindera バックエンドを有効化する集約フラグ。直接指定しない。
 _lindera = ["dep:lindera"]
+# v0.2 自動化（harvest/evaluate）。外部エンジン（VOICEVOX/say/ffmpeg/Qwen3-ASR）は
+# subprocess・ローカル HTTP で駆動する。default には決して足さない（SPEC D2）。
+harvest = ["_lindera", "dep:ureq", "dep:sha2"]
 
 [dependencies]
 anyhow = "1"
@@ -35,6 +38,8 @@ similar = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 lindera = { version = "3", optional = true }
+ureq = { version = "2", optional = true }
+sha2 = { version = "0.10", optional = true }
 
 [profile.release]
 # 辞書埋め込みでバイナリが大きくなるため、サイズ寄りの最適化にしておく。
