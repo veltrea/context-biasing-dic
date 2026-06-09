@@ -45,4 +45,9 @@ impl TextSource for FileSource {
     fn dedup_across_runs(&self) -> bool {
         false
     }
+
+    /// 明示された入力は品質フィルタを通さない（短い文も記号入りも読ませる）。
+    fn trusted_input(&self) -> bool {
+        true
+    }
 }

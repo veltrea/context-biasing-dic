@@ -47,4 +47,12 @@ pub trait TextSource {
     fn dedup_across_runs(&self) -> bool {
         true
     }
+
+    /// 本文が「ユーザーの明示入力」なら true。例文化の品質フィルタ（文長・
+    /// 日本語率・残骸・記事内上限）を外し、構造除去・文分割・重複排除だけを
+    /// 行う — 読ませると決めた文を黙って捨てない。記事のような未選別の
+    /// テキストを流すネットソースは false のまま。
+    fn trusted_input(&self) -> bool {
+        false
+    }
 }

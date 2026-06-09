@@ -516,15 +516,27 @@ fn run_harvest(
             "{}",
             msg!(
                 format!(
-                    "vote: {} pair(s) adopted, {} dropped (fewer than {} distinct speakers).",
+                    "vote: {} pair(s) adopted, {} dropped (fewer than {} distinct speakers):",
                     report.vote.passed_pairs, report.vote.dropped_pairs, min_votes
                 ),
                 format!(
-                    "投票: 採用 {} ペア、棄却 {} ペア（異なり話者 {} 未満）。",
+                    "投票: 採用 {} ペア、棄却 {} ペア（異なり話者 {} 未満）:",
                     report.vote.passed_pairs, report.vote.dropped_pairs, min_votes
                 ),
             )
         );
+        // 棄却の内訳: 偽陽性（話者固有の癖）が削れたことを目で確認できる肝。
+        for (reference, hypothesis, speakers) in &report.vote.dropped {
+            eprintln!(
+                "  [voted out] {} \u{2190} {} ({})",
+                reference,
+                hypothesis,
+                msg!(
+                    format!("{speakers} speaker(s)"),
+                    format!("話者 {speakers}"),
+                )
+            );
+        }
     }
     eprintln!(
         "{}",

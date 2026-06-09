@@ -95,7 +95,12 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
 
     // 例文化（extract: 構造除去 → フィルタ → スコア → 記事内重複排除）に、
     // 実行内の記事間重複と、seen による実行間重複の排除を重ねる。
-    let extract_opts = ExtractOptions::default();
+    // 明示入力（FileSource）は品質フィルタなしの lenient プロファイル。
+    let extract_opts = if deps.source.trusted_input() {
+        ExtractOptions::lenient()
+    } else {
+        ExtractOptions::default()
+    };
     let mut pending: Vec<PendingArticle> = Vec::new();
     let mut in_run: BTreeSet<String> = BTreeSet::new();
     let mut skipped_articles = 0usize;
@@ -445,6 +450,10 @@ mod tests {
         fn dedup_across_runs(&self) -> bool {
             false
         }
+
+        fn trusted_input(&self) -> bool {
+            true
+        }
     }
 
     /// ネットソース相当（dedup_across_runs = true・記事 id を指定できる）。
@@ -646,7 +655,9 @@ mod tests {
     #[test]
     fn dry_run_touches_no_engine() {
         let dir = test_cache_dir("dryrun");
-        // 短い行は extract のフィルタで落ち、20 字以上の 2 文だけ残る。
+        // 明示入力（trusted_input）は短い行も捨てない（Step 1 からの不変条件。
+        // extract 統合時に 20 字フィルタがかかって 1 行 1 文入力を黙って
+        // 捨てる退行が実際に起きた — 3 話者実験で発見）。
         let source = FixedSource(vec![REF_KAI, "短い行", REF_INU]);
         let synth = TextWritingSynth::new();
         let rec = MappingRecognizer::new(&[]);
@@ -663,9 +674,10 @@ mod tests {
 
         assert_eq!(synth.calls.get(), 0);
         assert_eq!(rec.calls.get(), 0);
-        assert_eq!(report.sentences, 2);
+        assert_eq!(report.sentences, 3);
         let got = report.dry_run_sentences.unwrap();
         assert!(got.contains(&REF_KAI.to_string()));
+        assert!(got.contains(&"短い行".to_string()));
         assert!(got.contains(&REF_INU.to_string()));
         // dry-run はキャッシュディレクトリも作らない。
         assert!(!dir.exists());

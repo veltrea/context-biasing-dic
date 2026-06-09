@@ -21,6 +21,8 @@ pub struct ExtractOptions {
     pub max_len: usize,
     /// 日本語文字率の下限。
     pub min_japanese_ratio: f64,
+    /// 残骸文字・括弧バランスの検査を行うか。
+    pub check_residue: bool,
     /// 1 記事から採る文数の上限（長い記事が収穫を支配しないように）。
     pub max_per_article: usize,
 }
@@ -31,13 +33,31 @@ impl Default for ExtractOptions {
             min_len: 20,
             max_len: 80,
             min_japanese_ratio: 0.5,
+            check_residue: true,
             max_per_article: 20,
         }
     }
 }
 
-/// 記事本文 1 本から文を抽出する。戻りは漢字密度スコア降順（同率は出現順）で、
-/// `max_per_article` 適用済み。記事内の重複は正規化キーで排除済み。
+impl ExtractOptions {
+    /// 明示入力（FileSource など `trusted_input` なソース）用の緩いプロファイル。
+    /// 構造除去・文分割・重複排除だけ行い、品質フィルタ（文長・日本語率・
+    /// 残骸・記事内上限）はかけない — ユーザーが読ませると決めた文を
+    /// 黙って捨てない。Plain 本文ならば実質「行分割 + trim + 重複排除」になる。
+    pub fn lenient() -> Self {
+        Self {
+            min_len: 1,
+            max_len: usize::MAX,
+            min_japanese_ratio: 0.0,
+            check_residue: false,
+            max_per_article: usize::MAX,
+        }
+    }
+}
+
+/// 記事本文 1 本から文を抽出する。記事内の重複は正規化キーで排除済み。
+/// `max_per_article` を超える場合は漢字密度スコアの高い文を優先して残す
+/// （同音衝突は漢語に集中する — SPEC 7 章）。出力順は常に記事内の出現順。
 pub fn extract(body: &Body, opts: &ExtractOptions) -> Vec<String> {
     let plain = match body {
         Body::Markdown(s) => strip_markdown(s),
@@ -46,7 +66,7 @@ pub fn extract(body: &Body, opts: &ExtractOptions) -> Vec<String> {
     };
 
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    // (漢字率, 出現順, 文)。ソート後に上限を切る。
+    // (漢字率, 出現順, 文)。上限を超えたときだけスコアで選抜する。
     let mut scored: Vec<(f64, usize, String)> = Vec::new();
     for (idx, sent) in split_sentences(&plain).into_iter().enumerate() {
         if !passes_filters(&sent, opts) {
@@ -58,13 +78,16 @@ pub fn extract(body: &Body, opts: &ExtractOptions) -> Vec<String> {
         scored.push((kanji_ratio(&sent), idx, sent));
     }
 
-    // 同音衝突は漢語に集中する（SPEC 7 章）ため、漢字含有率の高い文を優先。
-    scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
-            .unwrap_or(Ordering::Equal)
-            .then(a.1.cmp(&b.1))
-    });
-    scored.truncate(opts.max_per_article);
+    if scored.len() > opts.max_per_article {
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then(a.1.cmp(&b.1))
+        });
+        scored.truncate(opts.max_per_article);
+        // 選抜後は出現順に戻す（dry-run の読みやすさ・処理順の自然さ）。
+        scored.sort_by_key(|x| x.1);
+    }
     scored.into_iter().map(|(_, _, s)| s).collect()
 }
 
@@ -334,7 +357,7 @@ fn passes_filters(s: &str, opts: &ExtractOptions) -> bool {
     if japanese_ratio(s) < opts.min_japanese_ratio {
         return false;
     }
-    if has_residue(s) {
+    if opts.check_residue && has_residue(s) {
         return false;
     }
     true
@@ -601,25 +624,32 @@ mod tests {
     }
 
     #[test]
-    fn kanji_density_orders_results() {
-        // 漢字率: SENT_A（多）> ひらがな多めの文（少）。
-        let hira = "これはひらがなだけでできているながいぶんしょうです";
-        let body = md(&format!("{hira}。\n{SENT_A}。"));
-        let got = default_extract(&body);
-        assert_eq!(got[0], SENT_A);
-        assert_eq!(got[1], hira);
+    fn cap_keeps_kanji_dense_sentences_and_preserves_order() {
+        // 上限(20)超え: 同率のひらがな主体文 20 + 漢字率の高い文 1（最後に出現）。
+        // 漢字文は最後尾の出現でも生き残り、同率群の末尾 1 文が落ちる。
+        // 出力は選抜後も出現順。
+        let mut text = String::new();
+        for i in 0..20 {
+            text.push_str(&format!(
+                "これはひらがなが多めのながいぶんしょう{i:02}番です。\n"
+            ));
+        }
+        text.push_str(&format!("{SENT_A}。\n"));
+        let got = default_extract(&md(&text));
+        assert_eq!(got.len(), 20);
+        // 漢字率の高い文が生き残り、出現順なので最後に来る。
+        assert_eq!(got.last().unwrap(), SENT_A);
+        // 同率（出現順優先）の末尾、19 番の文が落ちる。
+        assert!(!got.iter().any(|s| s.contains("19番")));
     }
 
     #[test]
-    fn per_article_cap_limits_output() {
-        // 21 個のユニークな文 → 20 個に切られる。
-        let mut text = String::new();
-        for i in 0..21 {
-            // 漢数字で文をユニーク化しつつ 20 字以上を保つ。
-            text.push_str(&format!("第{i}番目の試験用文章として意味の通る長さを確保する。\n"));
-        }
-        let got = default_extract(&md(&text));
-        assert_eq!(got.len(), 20);
+    fn under_cap_keeps_document_order() {
+        // 上限未満なら選抜もソートもせず、記事の出現順のまま。
+        let hira = "これはひらがなだけでできているながいぶんしょうです";
+        let body = md(&format!("{hira}。\n{SENT_A}。"));
+        let got = default_extract(&body);
+        assert_eq!(got, vec![hira.to_string(), SENT_A.to_string()]);
     }
 
     #[test]
@@ -643,5 +673,15 @@ mod tests {
         let body = Body::Plain(format!("{SENT_A}\nshort"));
         let got = default_extract(&body);
         assert_eq!(got, vec![SENT_A.to_string()]);
+    }
+
+    #[test]
+    fn lenient_profile_keeps_short_and_symbol_sentences() {
+        // 明示入力: 19 字以下も記号入りも捨てない（重複排除だけ効く）。
+        let short = "確率的な基盤を確立する";
+        let symbols = "PATH=value を設定する";
+        let body = Body::Plain(format!("{short}\n{symbols}\n{short}"));
+        let got = extract(&body, &ExtractOptions::lenient());
+        assert_eq!(got, vec![short.to_string(), symbols.to_string()]);
     }
 }
