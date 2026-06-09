@@ -35,6 +35,8 @@ pub mod morph;
 #[cfg(feature = "harvest")]
 pub mod asr_qwen3_mlx;
 #[cfg(feature = "harvest")]
+pub mod evaluate;
+#[cfg(feature = "harvest")]
 pub mod ffmpeg;
 #[cfg(feature = "harvest")]
 pub mod harvest;

@@ -149,6 +149,7 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
 
     let cache = Cache::new(&opts.cache_dir)?;
     let mut book = VoteBook::new();
+    let mut refs = Refs::load(&opts.cache_dir);
     let mut audio_cache_hits = 0usize;
     let mut asr_cache_hits = 0usize;
     let mut failures = 0usize;
@@ -212,6 +213,8 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
                 if asr_was_cached {
                     asr_cache_hits += 1;
                 }
+                // evaluate 用に「音声キー → 正解文」の対応を残す（SPEC 14 章の入力）。
+                refs.record(&audio_key, sent)?;
 
                 // 既存コアへ。ASR は句読点を即興で挿入する（Step 0 実測: 「回答」が
                 // 「、解答」とアラインされ読み不一致扱いになった）ため、表記 diff の
@@ -277,6 +280,81 @@ pub fn run(deps: &HarvestDeps, opts: &HarvestOpts) -> Result<HarvestReport> {
 /// std の `DefaultHasher` はバージョン間の安定保証がないため使わない。
 fn sentence_hash(s: &str) -> String {
     content_key(&[&extract::normalize_sentence(s)])
+}
+
+/// `evaluate` が再利用する「音声キー → 正解文」の対応（`refs.jsonl`）。
+///
+/// 1 行 1 JSON（`{"audio":"<audio_key>","text":"<sentence>"}`、audio_key で
+/// 一意）。文がキャッシュ内に残るのは `articles/` と同等の扱いで、
+/// `harvest_cache/` ごと git-ignore 済み。evaluate はこれを読んで
+/// 「キャッシュ済み音声セット + 正解」を組み立てる（SPEC 14 章の入力）。
+pub(crate) struct Refs {
+    path: PathBuf,
+    known: BTreeSet<String>,
+}
+
+impl Refs {
+    fn load(cache_dir: &Path) -> Self {
+        let path = cache_dir.join("refs.jsonl");
+        let mut known = BTreeSet::new();
+        if let Ok(text) = fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if let Some(a) = v.get("audio").and_then(|x| x.as_str()) {
+                    known.insert(a.to_string());
+                }
+            }
+        }
+        Self { path, known }
+    }
+
+    /// 対応を 1 件記録する（audio_key が新出のときだけ追記）。
+    fn record(&mut self, audio_key: &str, text: &str) -> Result<()> {
+        if !self.known.insert(audio_key.to_string()) {
+            return Ok(());
+        }
+        use std::io::Write as _;
+        if let Some(dir) = self.path.parent() {
+            fs::create_dir_all(dir)?;
+        }
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("failed to open {}", self.path.display()))?;
+        writeln!(
+            f,
+            "{}",
+            serde_json::json!({ "audio": audio_key, "text": text })
+        )?;
+        Ok(())
+    }
+
+    /// 全対応を (audio_key, 正解文) で返す（evaluate の入力）。
+    pub(crate) fn entries(cache_dir: &Path) -> Vec<(String, String)> {
+        let path = cache_dir.join("refs.jsonl");
+        let mut out = Vec::new();
+        let mut seen = BTreeSet::new();
+        if let Ok(text) = fs::read_to_string(&path) {
+            for line in text.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let (Some(a), Some(t)) = (
+                    v.get("audio").and_then(|x| x.as_str()),
+                    v.get("text").and_then(|x| x.as_str()),
+                ) else {
+                    continue;
+                };
+                if seen.insert(a.to_string()) {
+                    out.push((a.to_string(), t.to_string()));
+                }
+            }
+        }
+        out
+    }
 }
 
 /// 実行をまたいだ既処理の記録（SPEC 12 章の `seen.jsonl`）。
@@ -357,7 +435,7 @@ impl Seen {
 /// ASR が読点・句点を即興で挿入し、置換ブロックに句読点が混ざって読み比較が
 /// 崩れるのを防ぐ（Step 0 実測）。対象は観測された全角句読点のみ。半角の
 /// `.`/`,` は「1.5」など数値の一部になりうるため触らない。
-fn strip_punct(s: &str) -> String {
+pub(crate) fn strip_punct(s: &str) -> String {
     s.chars()
         .filter(|c| !matches!(c, '、' | '。' | '，' | '．'))
         .collect()
@@ -365,7 +443,7 @@ fn strip_punct(s: &str) -> String {
 
 /// 内容アドレスのキー。部品を長さプレフィックス付きで連結して SHA-256 する
 /// （区切り文字が本文に現れても衝突しない）。
-fn content_key(parts: &[&str]) -> String {
+pub(crate) fn content_key(parts: &[&str]) -> String {
     let mut hasher = Sha256::new();
     for p in parts {
         hasher.update((p.len() as u64).to_le_bytes());
@@ -380,7 +458,7 @@ fn content_key(parts: &[&str]) -> String {
 }
 
 /// 書き込み途中ファイルの一時名（`{name}.part`）。rename で完成させる。
-fn part_path(p: &Path) -> PathBuf {
+pub(crate) fn part_path(p: &Path) -> PathBuf {
     let name = p
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -389,28 +467,42 @@ fn part_path(p: &Path) -> PathBuf {
 }
 
 /// キャッシュのディレクトリ配置（SPEC 12 章）。
-struct Cache {
+pub(crate) struct Cache {
     audio_dir: PathBuf,
     asr_dir: PathBuf,
+    asr_biased_dir: PathBuf,
 }
 
 impl Cache {
-    fn new(dir: &Path) -> Result<Self> {
+    pub(crate) fn new(dir: &Path) -> Result<Self> {
         let audio_dir = dir.join("audio");
         let asr_dir = dir.join("asr");
+        let asr_biased_dir = dir.join("asr-biased");
         fs::create_dir_all(&audio_dir)
             .with_context(|| format!("failed to create {}", audio_dir.display()))?;
         fs::create_dir_all(&asr_dir)
             .with_context(|| format!("failed to create {}", asr_dir.display()))?;
-        Ok(Self { audio_dir, asr_dir })
+        fs::create_dir_all(&asr_biased_dir)
+            .with_context(|| format!("failed to create {}", asr_biased_dir.display()))?;
+        Ok(Self {
+            audio_dir,
+            asr_dir,
+            asr_biased_dir,
+        })
     }
 
-    fn audio_path(&self, key: &str) -> PathBuf {
+    pub(crate) fn audio_path(&self, key: &str) -> PathBuf {
         self.audio_dir.join(format!("{key}.wav"))
     }
 
-    fn asr_path(&self, key: &str) -> PathBuf {
+    pub(crate) fn asr_path(&self, key: &str) -> PathBuf {
         self.asr_dir.join(format!("{key}.txt"))
+    }
+
+    /// バイアシング下の認識結果。キーには語リストの内容も入っている
+    /// （`evaluate` 参照）ため、辞書が変われば別のファイルになる。
+    pub(crate) fn asr_biased_path(&self, key: &str) -> PathBuf {
+        self.asr_biased_dir.join(format!("{key}.txt"))
     }
 }
 

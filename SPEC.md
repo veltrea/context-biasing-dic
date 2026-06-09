@@ -287,12 +287,18 @@ by multi-voice voting (sec. 11).
   # the model is loaded once per process; bias maps to the system prompt
   ```
 
-- **Biasing**: `bias` words are injected via the model's **system prompt**.
-  Verified in the mlx-audio source: `generate(..., system_prompt=...)` →
-  `_build_prompt` places it into the `<|im_start|>system` role; the official
-  high-level API exposes the same mechanism as `context=`. Initial assumption:
-  words joined by single spaces; the exact format is confirmed against the
-  official implementation before `evaluate` ships (open question Q1).
+- **Biasing**: `bias` words are injected via the model's **system prompt** —
+  joined by single spaces, no preamble (matches the official Qwen3-ASR
+  `context` examples). Verified in the mlx-audio source:
+  `generate(..., system_prompt=...)` → `_build_prompt` places it into the
+  `<|im_start|>system` role.
+- **The driver is the only biasing path, not just an optimization.** The
+  mlx-audio 0.4.4 CLI accepts `--context` but filters kwargs by
+  `inspect.signature(model.generate)`, and the Qwen3 signature has no
+  `context` parameter — the flag is silently dropped (confirmed by reading
+  the installed source; resolves Q1). Biasing therefore must go through the
+  Python API's `system_prompt=`, i.e. through this driver. Measured driver
+  speedup: 10 sentences ≈ 21 s (one process per file) → ≈ 4 s (driver).
 
 ## 10. Core reuse
 
@@ -315,11 +321,15 @@ cannot create dictionary entries on their own. Voting happens before
 harvest_cache/
   articles/{source}/{id}.json   # fetched articles (API not hit again on re-run)
   seen.jsonl                    # processed article ids + sentence hashes
+  refs.jsonl                    # audio-key -> reference sentence (evaluate's input)
   audio/{sha256(text|engine|voice|rate)}.wav   # TTS output (most expensive asset)
   asr/{sha256(audio-key|model)}.txt   # recognition results (without bias);
                                       # the model name is part of the key, so
                                       # switching models never reuses stale text
-  asr-biased/{hash}/{n}.txt     # recognition results under top-N biasing
+  asr-biased/{sha256(audio-key|model|bias-words)}.txt
+                                # recognition under biasing; the joined word
+                                # list is part of the key, so a changed
+                                # dictionary never reuses stale results
 ```
 
 Audio and recognitions are content-addressed; interrupting `harvest`, or
@@ -348,10 +358,11 @@ biasdiff harvest --source qiita --query "stocks:>=20 tag:rust" --count 5 --dry-r
 
 # Evaluate: find the plateau point of the dictionary
 biasdiff evaluate \
-  --dict dev.biasing.json \
+  --input dev.biasing.json \
   --cache-dir ./harvest_cache \
   --step 25 --max-words 300 \
   --report curve.tsv
+# (--input, not --dict: --dict is the global morphological-dictionary switch)
 ```
 
 `harvest` options: `--source` is repeatable (`qiita` | `zenn` | `file`), with
@@ -362,7 +373,7 @@ per-source options (`--query` for Qiita, `--topic` / `--order` for Zenn,
 and prints the sentences. Output options (`--format`, `--field`, `-o`,
 `--reject`) and global options (`--dict`, `--strict`) are shared with v0.1.
 
-`evaluate` options: `--dict` (the dictionary to test), `--cache-dir` (reuses
+`evaluate` options: `--input` (the dictionary file to test), `--cache-dir` (reuses
 harvested audio + references), `--step` / `--max-words` (the N schedule),
 `--min-delta` / `--patience` (plateau detection), `--report` (TSV curve),
 `--prune` (emit the subset of words observed to actually fix collisions).
@@ -416,7 +427,7 @@ and `harvest_cache/` is git-ignored.
 
 | # | Question | Resolution path |
 | --- | --- | --- |
-| Q1 | Exact biasing prompt format (separator, preamble). | Read the official `qwen_asr` `context=` implementation before building `evaluate` (Step 4). |
+| Q1 | ~~Exact biasing prompt format (separator, preamble).~~ **Resolved 2026-06-10**: words joined by single spaces, no preamble, passed to the Python API's `system_prompt=` (the 0.4.4 CLI `--context` never reaches Qwen3 — dropped by signature filtering). Verified live: an unbiased "非会学習" misrecognition was fixed to "機械学習" by biasing with the harvested dictionary. | Closed in Step 4 (see sec. 9). |
 | Q2 | 0.6B vs 1.7B accuracy/speed trade-off for Japanese. | Benchmark both in Step 1 on the same sentence set. |
 | Q3 | Do TTS-harvested collisions transfer to human speech? | First measurement in Step 0; spot-check against the v0.1 manual repl periodically. |
 | Q4 | When to switch readings to UniDic (`--features unidic`). | Unchanged option from v0.1; revisit if reading mismatches dominate the reject log. |

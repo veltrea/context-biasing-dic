@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 #[cfg(feature = "harvest")]
 use crate::{
     asr_qwen3_mlx::Qwen3MlxRecognizer,
+    evaluate::{self, EvaluateDeps, EvaluateOpts},
     harvest::{self, HarvestDeps, HarvestOpts},
     recognize::Recognizer,
     source::TextSource,
@@ -158,6 +159,44 @@ enum Command {
         /// `amical-json` 出力時の分野ラベル（JSON の `field`）。
         #[arg(long, default_value = "general")]
         field: String,
+    },
+    /// 辞書をバイアシング投入して衝突率の頭打ち点を探す（v0.2、要 --features harvest）。
+    #[cfg(feature = "harvest")]
+    Evaluate {
+        /// 試験する辞書ファイル（amical-json / counts / txt を自動判別。語は count 降順前提）。
+        /// （`--dict` はグローバルの形態素辞書選択と衝突するため `--input`）
+        #[arg(long)]
+        input: PathBuf,
+        /// harvest が音声と正解を残したキャッシュディレクトリ。
+        #[arg(long, default_value = "./harvest_cache")]
+        cache_dir: PathBuf,
+        /// ASR エンジン（qwen3-mlx のみ）。
+        #[arg(long, default_value = "qwen3-mlx")]
+        asr: String,
+        /// ASR モデル。
+        #[arg(long, default_value = "mlx-community/Qwen3-ASR-0.6B-8bit")]
+        model: String,
+        /// mlx-audio が入った環境の python。
+        #[arg(long, default_value = "python3")]
+        asr_python: PathBuf,
+        /// バイアシング語数 N の刻み。
+        #[arg(long, default_value_t = 25)]
+        step: usize,
+        /// N の上限。
+        #[arg(long, default_value_t = 300)]
+        max_words: usize,
+        /// 頭打ち判定: 1 ステップの衝突率改善がこれ未満なら改善なし。
+        #[arg(long, default_value_t = 0.01)]
+        min_delta: f64,
+        /// 改善なしが連続この回数で頭打ちと判定。
+        #[arg(long, default_value_t = 2)]
+        patience: usize,
+        /// カーブ（`N\t衝突数\t率`）の TSV 出力先。
+        #[arg(long)]
+        report: Option<PathBuf>,
+        /// 実際に衝突を直した語だけの部分集合を書き出す先。
+        #[arg(long)]
+        prune: Option<PathBuf>,
     },
 }
 
@@ -329,6 +368,137 @@ pub fn run() -> Result<()> {
                 spec,
             )
         }
+        #[cfg(feature = "harvest")]
+        Command::Evaluate {
+            input: dict,
+            cache_dir,
+            asr,
+            model,
+            asr_python,
+            step,
+            max_words,
+            min_delta,
+            patience,
+            report,
+            prune,
+        } => {
+            let recognizer: Box<dyn Recognizer> = match asr.as_str() {
+                "qwen3-mlx" => Box::new(Qwen3MlxRecognizer::new(&asr_python, model.clone())),
+                other => anyhow::bail!(msg!(
+                    format!("unknown ASR engine '{other}' (qwen3-mlx)"),
+                    format!("ASR エンジン '{other}' は未対応です（qwen3-mlx）"),
+                )),
+            };
+            let words = load_dict_words(&dict)?;
+            eprintln!(
+                "{}",
+                msg!(
+                    format!("evaluating {} word(s) from {}", words.len(), dict.display()),
+                    format!("辞書 {}（{} 語）を評価します", dict.display(), words.len()),
+                )
+            );
+            let deps = EvaluateDeps {
+                recognizer: recognizer.as_ref(),
+                tokenizer: &tokenizer,
+            };
+            let eopts = EvaluateOpts {
+                words,
+                cache_dir,
+                asr_model: model,
+                step,
+                max_words,
+                min_delta,
+                patience,
+                normalize: opts,
+                verbose: true,
+            };
+            let result = evaluate::run(&deps, &eopts)?;
+
+            // カーブ TSV（SPEC 14 章: `N\tcollisions\trate`）。
+            if let Some(p) = report {
+                let mut w = BufWriter::new(
+                    File::create(&p).with_context(|| format!("failed to create {}", p.display()))?,
+                );
+                for pt in &result.points {
+                    writeln!(w, "{}\t{}\t{:.6}", pt.n, pt.collisions, pt.rate)?;
+                }
+                w.flush()?;
+            }
+            if let Some(p) = prune {
+                let mut w = BufWriter::new(
+                    File::create(&p).with_context(|| format!("failed to create {}", p.display()))?,
+                );
+                for word in &result.pruned {
+                    writeln!(w, "{word}")?;
+                }
+                w.flush()?;
+            }
+
+            eprintln!(
+                "{}",
+                msg!(
+                    format!(
+                        "evaluated {} audio file(s), {} ASR run(s), {} failure(s).",
+                        result.sentences, result.asr_runs, result.failures
+                    ),
+                    format!(
+                        "評価: 音声 {} 本、新規認識 {} 回、失敗 {} 件。",
+                        result.sentences, result.asr_runs, result.failures
+                    ),
+                )
+            );
+            match result.recommended_n {
+                Some(n) => eprintln!(
+                    "{}",
+                    msg!(
+                        format!(
+                            "recommended N = {} ({} word(s) fixed collisions; see --prune output).",
+                            n,
+                            result.pruned.len()
+                        ),
+                        format!(
+                            "推奨 N = {}（衝突を実際に直した語 {} 語。--prune 出力参照）。",
+                            n,
+                            result.pruned.len()
+                        ),
+                    )
+                ),
+                None => eprintln!(
+                    "{}",
+                    msg!(
+                        "no plateau detected (still improving at max-words, or the dictionary has no effect).",
+                        "頭打ちを検出できませんでした（max-words でも改善中か、辞書が効いていません）。",
+                    )
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 辞書ファイルから語リストを読む（count 降順前提）。先頭の非空白が `{` なら
+/// amical-json（`terms[].word`）、それ以外は 1 行 1 語（タブ区切りは 1 列目）。
+#[cfg(feature = "harvest")]
+fn load_dict_words(path: &Path) -> Result<Vec<String>> {
+    let text =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if text.trim_start().starts_with('{') {
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))?;
+        let Some(terms) = v.get("terms").and_then(|t| t.as_array()) else {
+            anyhow::bail!("{} has no `terms` array (amical-json expected)", path.display());
+        };
+        Ok(terms
+            .iter()
+            .filter_map(|t| t.get("word").and_then(|w| w.as_str()).map(String::from))
+            .collect())
+    } else {
+        Ok(text
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').next().unwrap_or(l).trim().to_string())
+            .collect())
     }
 }
 

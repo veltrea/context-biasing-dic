@@ -281,11 +281,17 @@ GET https://zenn.dev/api/articles/{slug}
   # the model is loaded once per process; bias maps to the system prompt
   ```
 
-- **バイアシング**: `bias` の語はモデルの **system プロンプト**経由で注入する。
+- **バイアシング**: `bias` の語はモデルの **system プロンプト**経由で注入する —
+  半角スペース区切り・前置きなし（公式 Qwen3-ASR の `context` 例と同じ）。
   mlx-audio のソースで検証済み: `generate(..., system_prompt=...)` →
-  `_build_prompt` が `<|im_start|>system` ロールに配置する。公式の高レベル API
-  は同じ機構を `context=` として公開している。初期仮定は半角スペース区切り。
-  正確な書式は `evaluate` 実装前に公式実装を読んで確定する（未決事項 Q1）。
+  `_build_prompt` が `<|im_start|>system` ロールに配置する。
+- **ドライバは単なる高速化ではなく、バイアシングの唯一の経路。** mlx-audio
+  0.4.4 の CLI は `--context` を受けるが、kwargs を
+  `inspect.signature(model.generate)` で濾すため、Qwen3 の generate に無い
+  `context` は**黙って捨てられる**（導入済みソースを読んで確認。Q1 を解決）。
+  バイアシングは Python API の `system_prompt=`、すなわちこのドライバ経由で
+  しか届かない。ドライバの高速化実測: 10 文 ≈ 21 秒（1 ファイル 1 プロセス）
+  → ≈ 4 秒（ドライバ）。
 
 ## 10. 既存コアの再利用
 
@@ -308,11 +314,15 @@ GET https://zenn.dev/api/articles/{slug}
 harvest_cache/
   articles/{source}/{id}.json   # fetched articles (API not hit again on re-run)
   seen.jsonl                    # processed article ids + sentence hashes
+  refs.jsonl                    # audio-key -> reference sentence (evaluate's input)
   audio/{sha256(text|engine|voice|rate)}.wav   # TTS output (most expensive asset)
   asr/{sha256(audio-key|model)}.txt   # recognition results (without bias);
                                       # the model name is part of the key, so
                                       # switching models never reuses stale text
-  asr-biased/{hash}/{n}.txt     # recognition results under top-N biasing
+  asr-biased/{sha256(audio-key|model|bias-words)}.txt
+                                # recognition under biasing; the joined word
+                                # list is part of the key, so a changed
+                                # dictionary never reuses stale results
 ```
 
 音声と認識結果は内容アドレスで管理する。`harvest` の中断・再実行や、同じ
@@ -341,10 +351,11 @@ biasdiff harvest --source qiita --query "stocks:>=20 tag:rust" --count 5 --dry-r
 
 # Evaluate: find the plateau point of the dictionary
 biasdiff evaluate \
-  --dict dev.biasing.json \
+  --input dev.biasing.json \
   --cache-dir ./harvest_cache \
   --step 25 --max-words 300 \
   --report curve.tsv
+# (--input, not --dict: --dict is the global morphological-dictionary switch)
 ```
 
 `harvest` のオプション: `--source` は繰り返し指定可（`qiita` | `zenn` |
@@ -355,7 +366,7 @@ biasdiff evaluate \
 文を表示する。出力オプション（`--format`・`--field`・`-o`・`--reject`）と
 グローバルオプション（`--dict`・`--strict`）は v0.1 と共通。
 
-`evaluate` のオプション: `--dict`（試験する辞書）、`--cache-dir`（収穫済みの
+`evaluate` のオプション: `--input`（試験する辞書ファイル）、`--cache-dir`（収穫済みの
 音声 + 正解を再利用）、`--step` / `--max-words`（N のスケジュール）、
 `--min-delta` / `--patience`（頭打ち判定）、`--report`（TSV カーブ）、
 `--prune`（実際に衝突を直した語だけの部分集合を出力）。
@@ -408,7 +419,7 @@ output: curve.tsv lines "N<TAB>collisions<TAB>rate"; recommend smallest N at pla
 
 | # | 問い | 解決の道筋 |
 | --- | --- | --- |
-| Q1 | バイアシングプロンプトの正確な書式（区切り・前置き）。 | `evaluate` 構築前（Step 4）に公式 `qwen_asr` の `context=` 実装を読む。 |
+| Q1 | ~~バイアシングプロンプトの正確な書式（区切り・前置き）。~~ **2026-06-10 解決**: 半角スペース区切り・前置きなしで Python API の `system_prompt=` に渡す（0.4.4 の CLI `--context` は signature フィルタで Qwen3 に届かない）。実機検証済み: bias なしの誤認識「非会学習」が、収穫済み辞書の投入で「機械学習」に直った。 | Step 4 で解決（9 章参照）。 |
 | Q2 | 日本語での 0.6B と 1.7B の精度/速度トレードオフ。 | Step 1 で同じ文セットを両方でベンチする。 |
 | Q3 | TTS で収穫した衝突は人間の発話に転移するか。 | Step 0 で最初の実測。以後も v0.1 の手動 repl と定期的に突き合わせる。 |
 | Q4 | 読みを UniDic（`--features unidic`）に切り替える時期。 | v0.1 から変わらない選択肢。除外ログを読み不一致が支配したら再検討。 |

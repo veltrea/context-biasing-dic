@@ -288,6 +288,47 @@ vote: 9 pair(s) adopted, 1 dropped (fewer than 2 distinct speakers):
 公式 `QwenLM/Qwen3-ASR` の `context=` 実装を読み、`--context` への渡し方（区切り・前置き）を確定。
 mlx-audio 0.4.4 の CLI に `--context` があることは Step 0 で確認済み。
 
+#### Step 4 完了（2026-06-10）— evaluate + Q1 解決 + バッチドライバ
+
+**Q1 解決（Step 0 の見込みを覆す重要発見）**: mlx-audio 0.4.4 の CLI は `--context` を受けるが、
+kwargs を `inspect.signature(model.generate)` で濾すため **Qwen3 の generate に無い `context` は
+黙って捨てられる**（`--prompt` も同様。導入済みソース精読で確認）。biasing が届く唯一の経路は
+Python API の `system_prompt=`。書式は半角スペース区切り・前置きなし（公式 `context` 例と同形）。
+→ 教訓「README・--help でなく実装本体を読む」の再演。
+
+**biasing の実機実証（プロジェクト価値仮説の初検証）**:
+- bias なし:「**非会**学習で意思決定を…」（Step 0 から再現する誤り）
+- bias = 関連 3 語:「**機械**学習で…」に修正
+- **bias = 収穫済み辞書 10 語でも修正** — biasdiff が集めた語がそのまま biasing として機能
+
+**バッチドライバ（scripts/qwen3_asr_batch.py + アダプタ全面書き換え）**:
+- SPEC §9 の JSONL 契約 + ready ハンドシェイク。`include_str!` で埋め込み・実行時 temp 実体化
+  （バイナリ自己完結）。`RefCell<Option<Child>>` の遅延起動・Drop で stdin close → wait
+- **10 文 21 秒 → 4.3 秒**（モデル 1 回ロード、約 5 倍速。1 文 ~0.2 秒）
+
+**evaluate 実装**:
+- 入力は harvest が残す **refs.jsonl**（音声キー → 正解文。SPEC §12 に追記）。既存キャッシュからは
+  harvest 再実行（全命中・一瞬）で再構築できることを確認
+- N スケジュール 0..step..max（辞書サイズで終端）、`asr-biased/` キャッシュは
+  **キーに bias 語リスト内容を含む**（辞書が変われば別キャッシュ。SPEC §12 更新）。N=0 は
+  harvest の asr/ キャッシュとキー互換（収穫済みならゼロコスト）
+- 頭打ち: `--min-delta`（既定 0.01）/`--patience`（既定 2）。`--report` curve.tsv、
+  `--prune` = N=0 で衝突 ∧ 最終 N で消えた語（実際に直した語）
+- **CLI は `--input`**（`--dict` はグローバルの形態素辞書切替と clap 名前衝突 — 実行時 panic で発覚。
+  SPEC §13 更新）
+
+**実走（10 文 × 3 話者 = 30 音声、9 語辞書、N=0/3/6/9）**: 初回 26.7 秒・再実行 0.025 秒（冪等）
+- curve: N=0: 26 衝突 → N=3: 25 → N=6: 25 → **N=9: 27（悪化）**。推奨 N=3、prune = 主導・仕様・動機
+- **N=9 の悪化は SPEC リスク欄「語数を絞るほど効く帯」の実観測**。同音衝突を意図的に詰め込んだ
+  文セットでは bias 語同士が干渉する（対照・対称を同時投入すると全部そちらへ倒れる等）。
+  実記事由来の自然なセットでの再測定は Step 5 以降の宿題
+
+**テスト**: default 51 / harvest 65 全通過（evaluate 4 本追加: カーブ・辞書内容別キャッシュ・
+refs 無しエラー・plateau エッジ）。
+
+**次は Step 5**: 夜間自動回し（scripts/nightly-harvest.sh、WoL → SSH → 取り込み → shutdown、
+マシン固有情報はリポジトリ外）。GUI 統合は任意項目。
+
 ---
 
 **作成**: 2026-06-10（前セッション）
