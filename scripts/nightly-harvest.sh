@@ -196,10 +196,21 @@ log "done: artifacts in $OUT_DIR"
 ls -la "$OUT_DIR" >&2
 
 # 自律運用（pmset 自己起床 + launchd のローカル実行）では、収穫を終えたら
-# 自分で電源を落とす（電力節約）。パスワードレス sudo（/sbin/shutdown のみ
-# 許可）が前提。リモートモードの再帰実行にはこの変数は転送されないため、
-# 取り込み（scp）前にリモートが自爆することはない。
-if [ "$SHUTDOWN" = "1" ]; then
-    log "shutting down this machine"
-    sudo -n /sbin/shutdown -h now || log "warning: self-shutdown failed (sudoers?)"
-fi
+# 自分で電源状態を下げる（電力節約）。リモートモードの再帰実行にはこの変数は
+# 転送されないため、取り込み（scp）前にリモートが落ちることはない。
+#
+#   BIASDIFF_SHUTDOWN=sleep — スリープ（推奨）。Apple Silicon Mac は
+#       **shutdown 状態からは WoL で起こせない**（スリープからのみ）ため、
+#       日中にオンデマンドで起こしたいならスリープ一択。消費は 1W 未満。
+#   BIASDIFF_SHUTDOWN=1     — 完全シャットダウン。次の起動は pmset の
+#       電源オンスケジュール（wakeorpoweron）か物理ボタンのみ。
+case "$SHUTDOWN" in
+    sleep)
+        log "putting this machine to sleep"
+        pmset sleepnow || log "warning: sleepnow failed"
+        ;;
+    1 | shutdown)
+        log "shutting down this machine"
+        sudo -n /sbin/shutdown -h now || log "warning: self-shutdown failed (sudoers?)"
+        ;;
+esac
