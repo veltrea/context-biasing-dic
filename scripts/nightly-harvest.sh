@@ -29,6 +29,10 @@
 #   BIASDIFF_STEP         evaluate の N 刻み（既定: 25）
 set -euo pipefail
 
+# SSH 経由の non-login shell では Homebrew の PATH が通っていないことがある
+# （ffmpeg・uv が見つからず ASR 前段で全滅する）。スクリプト自身で自衛する。
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 REMOTE_HOST="${BIASDIFF_REMOTE_HOST:-}"
 REMOTE_DIR="${BIASDIFF_REMOTE_DIR:-}"
 REMOTE_MAC="${BIASDIFF_REMOTE_MAC:-}"
