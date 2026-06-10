@@ -78,10 +78,17 @@ if [ -n "$REMOTE_HOST" ]; then
     log "running nightly harvest on $REMOTE_HOST"
     # リモート側では同じスクリプトがローカルモードで走る。収穫パラメータを
     # 環境変数ごと運ぶ（REMOTE_* は落とすのでループしない）。
+    # BIASDIFF_VENV はパスを含むため**明示されたときだけ**運ぶ — 既定のまま
+    # 運ぶと、ローカルの $HOME で展開された venv パスがリモートへ漏れて
+    # 存在しない venv を探し、ASR が全滅する（実際に起きた）。
+    VENV_FORWARD=""
+    if [ -n "${BIASDIFF_VENV:-}" ]; then
+        VENV_FORWARD="BIASDIFF_VENV='$BIASDIFF_VENV'"
+    fi
     # shellcheck disable=SC2086
     ssh $SSH_OPTS "$REMOTE_HOST" \
         "cd '$REMOTE_DIR' && \
-         BIASDIFF_VENV='$VENV' \
+         $VENV_FORWARD \
          BIASDIFF_QIITA_QUERY='$QIITA_QUERY' \
          BIASDIFF_ZENN_TOPIC='$ZENN_TOPIC' \
          BIASDIFF_COUNT='$COUNT' \
