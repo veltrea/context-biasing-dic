@@ -119,6 +119,21 @@ fi
 OUT_DIR="$OUT_ROOT/$DATE_TAG"
 mkdir -p "$OUT_DIR"
 
+# ブート直後の実行（pmset 自己起床 + launchd）では VOICEVOX エンジンの
+# LaunchDaemon がまだ初期化中のことがある。立ち上がりを待ってから収穫する
+# （最大 2 分。来なければ警告して続行 — say フォールバック等の構成もあるため）。
+VOICEVOX_URL="${BIASDIFF_VOICEVOX_URL:-http://127.0.0.1:50021}"
+vv_tries=0
+until curl -s --max-time 2 "$VOICEVOX_URL/version" >/dev/null 2>&1; do
+    vv_tries=$((vv_tries + 1))
+    if [ "$vv_tries" -ge 24 ]; then
+        log "warning: VOICEVOX engine at $VOICEVOX_URL not reachable after ~2min"
+        break
+    fi
+    [ "$vv_tries" -eq 1 ] && log "waiting for VOICEVOX engine at $VOICEVOX_URL"
+    sleep 5
+done
+
 # venv を有効化（python3 = mlx-audio 入りの環境にする。ASR ドライバの前提）。
 if [ -f "$VENV/bin/activate" ]; then
     # shellcheck disable=SC1091
@@ -179,3 +194,12 @@ fi
 
 log "done: artifacts in $OUT_DIR"
 ls -la "$OUT_DIR" >&2
+
+# 自律運用（pmset 自己起床 + launchd のローカル実行）では、収穫を終えたら
+# 自分で電源を落とす（電力節約）。パスワードレス sudo（/sbin/shutdown のみ
+# 許可）が前提。リモートモードの再帰実行にはこの変数は転送されないため、
+# 取り込み（scp）前にリモートが自爆することはない。
+if [ "$SHUTDOWN" = "1" ]; then
+    log "shutting down this machine"
+    sudo -n /sbin/shutdown -h now || log "warning: self-shutdown failed (sudoers?)"
+fi
