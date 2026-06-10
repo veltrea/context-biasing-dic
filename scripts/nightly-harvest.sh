@@ -206,8 +206,9 @@ ls -la "$OUT_DIR" >&2
 #       電源オンスケジュール（wakeorpoweron）か物理ボタンのみ。
 case "$SHUTDOWN" in
     sleep)
+        # pmset sleepnow は root 必須（パスワードレス sudo の対象に含めること）。
         log "putting this machine to sleep"
-        pmset sleepnow || log "warning: sleepnow failed"
+        sudo -n /usr/bin/pmset sleepnow || log "warning: sleepnow failed (sudoers?)"
         ;;
     1 | shutdown)
         log "shutting down this machine"
