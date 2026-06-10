@@ -389,6 +389,39 @@ EnvironmentVariables で REMOTE_HOST/DIR/MAC・SSH_OPTS・FETCH_TO=`~/biasdiff-n
    ASR 全滅 → **明示時のみ転送**に修正（25e6cae）。このとき「失敗した文は seen に記録しない」設計が
    実地で機能: 事故回の記事は seen に入らず、修正後の再実行で音声キャッシュを再利用しつつ正しく収穫された
 
+#### 構成変更（2026-06-10 同日）— Mac mini 完全自律型へ
+
+ユーザー指摘「スケジュールはなぜローカル（開発機）？ テスト環境は Mac mini では」が正しく、
+調査で旧構成（開発機司令塔 + shutdown + WoL）の問題が連鎖的に発覚したため、同日中に組み替えた。
+
+**発覚した問題（いずれも今夜の初回実行を壊していた）**:
+1. **Apple Silicon Mac は shutdown 状態から WoL で起こせない**（スリープからのみ）。
+   午前の「WoL 成功」は既に起動していたマシンへの SSH（`up after ~0s`）で、未実証だった
+2. ブート直後は VOICEVOX エンジンの LaunchDaemon 初期化が間に合わず、収穫が即死するレース
+   → スクリプトに**エンジン起動待ち（最大 2 分）**を追加（b612f71）
+3. `shutdown -h now` が **GUI ログイン中ユーザー（LM Studio 用アカウント）にブロックされて未完了のまま固まり**、
+   nologin ファイル残留で「ping・画面共有は生きるが SSH だけ NO LOGINS 拒否」という紛らわしい状態に。
+   復旧は GUI からの再起動（ユーザー実施）
+4. `pmset sleepnow` は **root 必須**（一般ユーザー可は誤った前提）→ sudoers を
+   `/sbin/shutdown, /usr/bin/pmset sleepnow` の 2 コマンド NOPASSWD に拡張、スクリプトは `sudo -n`（06fe014）
+
+**新構成（時刻管理を Mac mini 自身に移譲・開発機は不要）**:
+- mini: `pmset repeat wakeorpoweron MTWRFSU 02:55:00`（自己起床。スリープからは wake、電源断からは power on）
+- mini: LaunchDaemon `local.biasdiff-nightly`（3:00、ローカルモード、`BIASDIFF_SHUTDOWN=sleep`、
+  HOME/BIASDIFF_VENV を plist で明示）→ 収穫後は**スリープ**（shutdown ではなく）
+- スリープ運用の利点: 日中も WoL で数秒で起こせる（消費 1W 未満）+ GUI セッションブロック問題と無縁
+- 開発機: 旧 launchd ジョブ `com.biasdiff.nightly` を撤去。朝 8:00 の確認タスクは
+  「WoL で起こす → mini 上のログ・成果物（`~/dev/context-biasing-dic/nightly/{date}/`）を確認 →
+  スリープに戻す」の新構成版へ更新
+
+**実証済み（pmset 電源ログで裏取り）**:
+- VOICEVOX デーモンのブート自動起動（ユーザーの再起動後に 0.24.1 即応答）
+- `env -i` の最小環境（LaunchDaemon 近似）で nightly が完走（seen による増分スキップも正常動作）
+- 強制スリープ投入（`Entering Sleep ... 'Software Sleep'`）→ **WoL 復帰（`DarkWake due to Enet.MagicPacket`、
+  SSH 復帰まで約 3 秒）**のフルサイクル
+
+**今夜 3:00 が自律サイクルの初実走**（2:55 自己起床 → 収穫 → スリープ）。成果物は mini 側に蓄積。
+
 ---
 
 **作成**: 2026-06-10（前セッション）
